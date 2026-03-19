@@ -119,19 +119,41 @@ Higher `w` on the interior walls ensures the particle does not cut
 unrealistically close to the legs; it arcs cleanly around the outside before
 entering through the gap.
 
+## Cost Field Visualisation
+
+A second plot is produced for debugging the cost landscape:
+
+```python
+plot_cost_field_and_vectors(x0, g, walls, trajectory=None, grid_n=60)
+```
+
+| Layer | What it shows |
+|-------|--------------|
+| `contourf` (plasma) | Total cost at every grid point. Bright = high cost (near walls, far from goal). Dark = low cost (near goal). |
+| `quiver` (white arrows) | Negative gradient `−∇C(x)` — the direction gradient descent moves the particle from each point. |
+| Cyan line | Actual trajectory overlaid on the field (when `trajectory` is passed). |
+
+**How to use it for debugging:**
+- If arrows near the bottom gap point inward and upward → the landscape correctly guides the particle through.
+- If arrows point sideways or outward near the gap → the wall parameters are too strong and the gap is not a viable corridor.
+- Bright cost bands around the n-shape legs show the influence radius `R` visually.
+
+`grid_n` controls resolution: `40` is fast, `60` is the default, `80+` gives finer contours.
+
 ## Project Structure
 
 ```
 main.py
-  goal_cost(x, g)                   — goal cost value
-  grad_goal(x, g)                   — analytic gradient of goal cost
-  point_to_segment(x, a, b)         — returns (d, p): distance + closest point
-  wall_cost(x, a, b, R, w)          — wall penalty value
-  grad_wall_penalty(x, a, b, R, w)  — analytic gradient of wall penalty
-  total_cost(x, g, walls)           — combined cost
-  total_gradient(x, g, walls)       — combined analytic gradient
-  run_simulation(x0, g, walls, ...) — gradient descent loop
-  plot_results(trajectory, ...)     — matplotlib visualisation
+  goal_cost(x, g)                          — goal cost value
+  grad_goal(x, g)                          — analytic gradient of goal cost
+  point_to_segment(x, a, b)               — returns (d, p): distance + closest point
+  wall_cost(x, a, b, R, w)                — wall penalty value
+  grad_wall_penalty(x, a, b, R, w)        — analytic gradient of wall penalty
+  total_cost(x, g, walls)                 — combined cost
+  total_gradient(x, g, walls)             — combined analytic gradient
+  run_simulation(x0, g, walls, ...)       — gradient descent loop
+  plot_results(trajectory, ...)           — trajectory visualisation
+  plot_cost_field_and_vectors(x0, g, ...) — cost landscape + descent vector field
 ```
 
 ## Parameters
@@ -163,6 +185,12 @@ pip install numpy matplotlib
 python main.py
 ```
 
-A window opens showing the particle trajectory (blue) routing around the
-outside of the n-shaped enclosure (black), entering through the bottom gap,
-and reaching the goal (red) inside. The outer square boundary is also shown.
+Two windows open:
+
+1. **Trajectory plot** — particle path (blue) routing around the outside of the
+   n-shaped enclosure (black), entering through the bottom gap, and reaching
+   the goal (red) inside.
+
+2. **Cost field plot** — plasma-coloured cost landscape with white descent
+   arrows and the trajectory overlaid in cyan. Use this to debug why the
+   particle routes the way it does.

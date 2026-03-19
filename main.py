@@ -176,7 +176,96 @@ def plot_results(trajectory, x0, g, walls):
 
 
 # ─────────────────────────────────────────────
-# 7. Main
+# 7. Cost field + gradient vector visualisation
+# ─────────────────────────────────────────────
+
+def plot_cost_field_and_vectors(x0, g, walls, trajectory=None, grid_n=60):
+    """
+    Visualise the total cost landscape and the descent direction field.
+
+    Parameters
+    ----------
+    x0         : start position (plotted in green)
+    g          : goal position  (plotted in red)
+    walls      : list of wall dicts with 'a','b','R','w'
+    trajectory : optional (N,2) array — overlaid in cyan if provided
+    grid_n     : number of grid points per axis (higher = finer but slower)
+
+    What each layer shows
+    ─────────────────────
+    contourf   : total cost value — bright = high cost (near walls or far from
+                 goal), dark = low cost (near goal, away from walls)
+    quiver     : negative gradient i.e. the direction the particle is pushed
+                 at each point. Arrows point downhill on the cost surface.
+    """
+    xs = np.linspace(0, 10, grid_n)
+    ys = np.linspace(0, 10, grid_n)
+    XX, YY = np.meshgrid(xs, ys)
+
+    Z = np.zeros_like(XX)
+    U = np.zeros_like(XX)   # -grad[0]  (x component of descent direction)
+    V = np.zeros_like(XX)   # -grad[1]  (y component of descent direction)
+
+    for i in range(grid_n):
+        for j in range(grid_n):
+            pos     = np.array([XX[i, j], YY[i, j]])
+            Z[i, j] = total_cost(pos, g, walls)
+            grad    = total_gradient(pos, g, walls)
+            U[i, j] = -grad[0]
+            V[i, j] = -grad[1]
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Cost contours — clip so wall spikes don't collapse the colour scale
+    Z_display = np.clip(Z, 0, np.percentile(Z, 95))
+    cf = ax.contourf(XX, YY, Z_display, levels=40, cmap='plasma')
+    plt.colorbar(cf, ax=ax, label='Total cost (clipped at 95th percentile)')
+
+    # Descent direction arrows — subsampled so they stay readable
+    step = max(1, grid_n // 20)
+    ax.quiver(XX[::step, ::step], YY[::step, ::step],
+              U[::step, ::step],  V[::step, ::step],
+              color='white', alpha=0.6, width=0.003, headwidth=4)
+
+    # Walls
+    for wall in walls:
+        ax.plot([wall['a'][0], wall['b'][0]],
+                [wall['a'][1], wall['b'][1]],
+                color='black', linewidth=3, zorder=4)
+
+    # Start and goal
+    ax.scatter(*x0, color='lime', s=120, zorder=6)
+    ax.scatter(*g,  color='red',  s=120, zorder=6)
+
+    legend_handles = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='lime',
+               markersize=10, label='Start'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='red',
+               markersize=10, label='Goal'),
+        Line2D([0], [0], color='black', linewidth=3, label='Wall'),
+        Line2D([0], [0], color='white', alpha=0.6, label='Descent direction'),
+    ]
+
+    # Optional trajectory overlay
+    if trajectory is not None:
+        ax.plot(trajectory[:, 0], trajectory[:, 1],
+                color='cyan', linewidth=1.5, zorder=5)
+        legend_handles.insert(0,
+            Line2D([0], [0], color='cyan', linewidth=1.5, label='Trajectory'))
+
+    ax.legend(handles=legend_handles, loc='upper left',
+              facecolor='#222', labelcolor='white')
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.set_aspect('equal')
+    ax.set_title("Total cost field and descent directions\n"
+                 "(arrows point downhill — the direction gradient descent moves)")
+    plt.tight_layout()
+    plt.show()
+
+
+# ─────────────────────────────────────────────
+# 8. Main
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -232,3 +321,7 @@ if __name__ == "__main__":
 
     trajectory = run_simulation(x0, g, walls, alpha=0.05, n_steps=800)
     plot_results(trajectory, x0, g, walls)
+
+    # Debug: show the cost landscape and descent vectors, with trajectory overlaid.
+    # Use a coarser grid (grid_n=40) for speed, or increase to 80+ for detail.
+    plot_cost_field_and_vectors(x0, g, walls, trajectory=trajectory, grid_n=60)
