@@ -377,18 +377,19 @@ def plot_multi_particle_results(trajectories, starts, g, walls, repulsion=False)
     g            : goal position
     walls        : list of wall dicts
     """
-    # One colour per particle, cycling through a qualitative palette
-    colours = plt.cm.tab10(np.linspace(0, 1, max(len(trajectories), 1)))
+    N = len(trajectories)
+    # Use a continuous colormap so N=25 particles all get distinct colours
+    colours = plt.cm.hsv(np.linspace(0, 0.85, max(N, 1)))
 
     fig, ax = plt.subplots(figsize=(8, 8))
 
     for i, traj in enumerate(trajectories):
         colour = colours[i % len(colours)]
-        ax.plot(traj[:, 0], traj[:, 1], color=colour, linewidth=1.4,
-                alpha=0.85, zorder=2)
+        ax.plot(traj[:, 0], traj[:, 1], color=colour, linewidth=0.9,
+                alpha=0.75, zorder=2)
         # Mark each start with a small filled circle in the same colour
         ax.scatter(*traj[0], color=colour, edgecolors='black',
-                   s=80, zorder=5, linewidths=0.8)
+                   s=50, zorder=5, linewidths=0.6)
 
     # Goal
     ax.scatter(*g, color='red', s=140, zorder=6, marker='*')
@@ -400,15 +401,15 @@ def plot_multi_particle_results(trajectories, starts, g, walls, repulsion=False)
                 color='black', linewidth=3, zorder=4)
 
     legend_handles = [
-        Line2D([0], [0], color='steelblue', linewidth=1.4,
-               label=f'Particle trajectories (N={len(trajectories)})'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='steelblue',
-               markeredgecolor='black', markersize=9, label='Start positions'),
+        Line2D([0], [0], color='grey', linewidth=0.9,
+               label=f'Trajectories (N={N})'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
+               markeredgecolor='black', markersize=7, label='Start positions'),
         Line2D([0], [0], marker='*', color='w', markerfacecolor='red',
                markersize=14, label='Goal'),
         Line2D([0], [0], color='black', linewidth=3, label='Wall'),
     ]
-    ax.legend(handles=legend_handles)
+    ax.legend(handles=legend_handles, loc='upper left')
     ax.set_xlim(0, 10)
     ax.set_ylim(0, 10)
     ax.set_aspect('equal')
@@ -557,25 +558,41 @@ if __name__ == "__main__":
     plot_cost_field_and_vectors(x0, g, walls, trajectory=trajectory, grid_n=60)
 
     # ── Multi-particle run ────────────────────────────────────────────────────
-    # Particles start from different positions around the n-shape.
-    # Each is simulated independently — same walls, same goal, no interaction.
-    starts = np.array([
-        [2.0, 2.0],   # lower-left  (must go around left leg)
-        [8.0, 2.0],   # lower-right (must go around right leg)
-        [5.5, 1.5],   # bottom-centre (aligned with the gap)
-        [1.5, 5.0],   # left side
-        [8.5, 5.0],   # right side
+    N = 25
+    np.random.seed(42)   # fix seed for reproducibility
+
+    # Sample starts from three regions outside the n-shape enclosure:
+    #   left  — x∈[1,3],   y∈[2,8]
+    #   right — x∈[7,9],   y∈[2,8]
+    #   bottom— x∈[3.5,7.5], y∈[1,2.5]
+    n_left   = N // 3
+    n_right  = N // 3
+    n_bottom = N - n_left - n_right
+
+    left_starts   = np.column_stack([
+        np.random.uniform(1.0, 3.0, n_left),
+        np.random.uniform(2.0, 8.0, n_left),
     ])
+    right_starts  = np.column_stack([
+        np.random.uniform(7.0, 9.0, n_right),
+        np.random.uniform(2.0, 8.0, n_right),
+    ])
+    bottom_starts = np.column_stack([
+        np.random.uniform(3.5, 7.5, n_bottom),
+        np.random.uniform(1.0, 2.5, n_bottom),
+    ])
+
+    starts = np.vstack([left_starts, right_starts, bottom_starts])
 
     # Independent (no repulsion)
     trajectories = run_multi_particle_simulation(
-        starts, g, walls, alpha=0.05, n_steps=800, tol=0.05
+        starts, g, walls, alpha=0.04, n_steps=1000, tol=0.05
     )
     plot_multi_particle_results(trajectories, starts, g, walls, repulsion=False)
 
     # With pairwise repulsion — synchronous updates, same walls and goal
     trajectories_repel = run_multi_particle_simulation_with_repulsion(
-        starts, g, walls, alpha=0.05, n_steps=800, tol=0.05,
-        R_p=0.8, w_p=60.0
+        starts, g, walls, alpha=0.04, n_steps=1000, tol=0.05,
+        R_p=0.6, w_p=30.0
     )
     plot_multi_particle_results(trajectories_repel, starts, g, walls, repulsion=True)

@@ -142,15 +142,17 @@ symmetry of the pairwise repulsion.
 
 ## Particle Start Positions
 
-```python
-starts = [
-    [2.0, 2.0],   # lower-left   — must go around the left leg
-    [8.0, 2.0],   # lower-right  — must go around the right leg
-    [5.5, 1.5],   # bottom-centre — aligned with the gap
-    [1.5, 5.0],   # left side
-    [8.5, 5.0],   # right side
-]
-```
+`N = 25` particles are sampled randomly across three regions outside the
+n-shape enclosure (`np.random.seed(42)` for reproducibility):
+
+| Region | x range | y range | Count |
+|--------|---------|---------|-------|
+| Left   | [1, 3]     | [2, 8]   | N // 3 |
+| Right  | [7, 9]     | [2, 8]   | N // 3 |
+| Bottom | [3.5, 7.5] | [1, 2.5] | remainder |
+
+Left and right particles must detour around the corresponding n-shape leg.
+Bottom particles are roughly aligned with the gap and enter more directly.
 
 ## Wall & Repulsion Parameters
 
@@ -160,8 +162,10 @@ starts = [
 | `boundary_w` | 80.0  | Penalty weight for outer boundary walls |
 | `interior_R` | 1.0   | Influence radius for n-shape walls |
 | `interior_w` | 120.0 | Penalty weight for n-shape walls (stronger to force detour) |
-| `R_p`        | 0.8   | Particle influence radius — repulsion activates when `d_ij < R_p` |
-| `w_p`        | 60.0  | Particle repulsion weight |
+| `R_p`        | 0.6   | Particle influence radius — smaller bubble lets 25 particles pass through the gap |
+| `w_p`        | 30.0  | Particle repulsion weight — softer so particles can still converge near the goal |
+| `alpha`      | 0.04  | Slightly reduced from 0.05 for stability with 25 interacting particles |
+| `n_steps`    | 1000  | Increased to give all particles time to converge |
 
 **Tuning `R_p` and `w_p`:** too large `R_p` spreads particles so far apart they
 may not all fit through the gap; too large `w_p` prevents particles converging
