@@ -9,11 +9,14 @@ detection, no path-finding (no A*), and no hard "if hit wall then stop" logic.
 
 The environment consists of:
 - An **outer square boundary** `[0,10] × [0,10]` made of 4 wall segments
-- One or more **interior wall segments** acting as obstacles
+- An **n-shaped interior enclosure** made of 3 wall segments (two vertical
+  legs + one top bar), open at the bottom
 
-Both boundary and interior walls use the exact same penalty framework.
-The particle stays inside the room because approaching the boundary raises
-the cost — not because of any special-case clamping.
+The goal is placed **inside** the n-shaped enclosure. The start is placed
+**outside and offset** so the direct path to the goal crosses the left leg.
+The particle must therefore detour around the outside of the n-shape and enter
+through the open bottom gap — behaviour that emerges entirely from the cost
+landscape, with no explicit routing rules.
 
 All gradients are derived analytically from first principles and implemented
 directly in code.
@@ -83,24 +86,38 @@ x = x - alpha * grad C(x)
 ```
 
 At each step the total analytic gradient is computed and the particle moves
-one step downhill. Wall avoidance (including room boundary containment) is a
-side-effect of cost minimisation.
+one step downhill. Wall avoidance (including room boundary containment and
+n-shape navigation) is a side-effect of cost minimisation.
 
 ## Environment Layout
 
 ```
-(0,10)────────────────(10,10)
-  │                       │
-  │    start (1,1)        │
-  │                       │
-  │    ████ interior      │
-  │    ████ wall          │
-  │         (4,2)-(4,7)   │
-  │                       │
-  │              goal     │
-  │             (9,9)     │
-(0,0)────────────────(10,0)
+(0,10)──────────────────────────────(10,10)
+  │                                     │
+  │    (3.5,8.5)──────────(7.5,8.5)     │
+  │        │   goal(5.5,7.0)  │         │
+  │        │                  │         │
+  │        │                  │         │
+  │    (3.5,3.0)          (7.5,3.0)     │
+  │             ↑ open gap              │
+  │   start(2,2)                        │
+(0,0)──────────────────────────────(10,0)
 ```
+
+The direct path from start `(2,2)` to goal `(5.5,7.0)` crosses the left leg.
+The particle is repelled by that leg and must route around the outside of the
+n-shape before aligning with the gap and entering from below.
+
+## Wall Parameters
+
+| Wall group      | `R`  | `w`   | Purpose |
+|-----------------|------|-------|---------|
+| Boundary walls  | 1.0  |  80.0 | Keep particle inside the room |
+| n-shape walls   | 1.0  | 120.0 | Strong enough to force a full detour around the enclosure |
+
+Higher `w` on the interior walls ensures the particle does not cut
+unrealistically close to the legs; it arcs cleanly around the outside before
+entering through the gap.
 
 ## Project Structure
 
@@ -125,8 +142,10 @@ main.py
 | `n_steps`    | Number of gradient descent iterations. |
 | `R`          | Wall influence radius. Repulsion activates when `d < R`. |
 | `w`          | Wall penalty weight. Higher = harder wall. |
-| `boundary_R` | Influence radius for the outer boundary walls (default `1.0`). |
-| `boundary_w` | Penalty weight for the outer boundary walls (default `80.0`). |
+| `boundary_R` | Influence radius for the outer boundary walls. |
+| `boundary_w` | Penalty weight for the outer boundary walls. |
+| `interior_R` | Influence radius for the n-shape walls. |
+| `interior_w` | Penalty weight for the n-shape walls. |
 
 ## Requirements
 
@@ -144,6 +163,6 @@ pip install numpy matplotlib
 python main.py
 ```
 
-A window opens showing the particle trajectory (blue) navigating around the
-interior wall (black) and staying within the square boundary (black), from
-start (green) to goal (red).
+A window opens showing the particle trajectory (blue) routing around the
+outside of the n-shaped enclosure (black), entering through the bottom gap,
+and reaching the goal (red) inside. The outer square boundary is also shown.

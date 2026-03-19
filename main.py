@@ -180,11 +180,14 @@ def plot_results(trajectory, x0, g, walls):
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    x0 = np.array([1.0, 1.0])
-    g  = np.array([9.0, 9.0])
+    # Start is outside and offset so the direct path to the goal is blocked
+    # by the left leg of the n-shape.  The particle must go around the outside
+    # and enter through the open bottom gap.
+    x0 = np.array([2.0, 2.0])
+    g  = np.array([5.5, 7.0])
 
-    # Outer square boundary [0,10]x[0,10] — same penalty framework as interior walls.
-    # The particle stays inside because crossing into the influence band (R) raises cost.
+    # ── Outer square boundary [0,10]×[0,10] ──────────────────────────────────
+    # Same penalty framework as every other wall — no special boundary logic.
     boundary_R = 1.0
     boundary_w = 80.0
     boundary_walls = [
@@ -198,15 +201,34 @@ if __name__ == "__main__":
          'R': boundary_R, 'w': boundary_w},
     ]
 
-    # Interior obstacle
+    # ── n-shaped interior enclosure ───────────────────────────────────────────
+    #
+    #   (3.5,8.5)────────────(7.5,8.5)   ← top bar
+    #      │                     │
+    #      │    goal (5.5,7.0)   │
+    #      │                     │
+    #   (3.5,3.0)           (7.5,3.0)    ← open bottom gap  (y < 3.0)
+    #
+    # Legs reach down to y=3.0 — well below the goal at y=7.0.
+    # The gap width is 4 units (x: 3.5→7.5).  With R=1.0 the influence bands
+    # consume 1 unit on each side, leaving ~2 units of navigable gap width.
+    #
+    # Start (2.0, 2.0) is to the lower-left.  The direct path to the goal
+    # crosses the left leg, so the particle is forced to detour around the
+    # outside of the n-shape and enter through the bottom opening.
+    #
+    interior_R = 1.0
+    interior_w = 120.0
     interior_walls = [
-        {'a': np.array([4.0, 2.0]),
-         'b': np.array([4.0, 7.0]),
-         'R': 1.5,
-         'w': 80.0},
+        {'a': np.array([3.5, 3.0]), 'b': np.array([3.5, 8.5]),  # left leg
+         'R': interior_R, 'w': interior_w},
+        {'a': np.array([3.5, 8.5]), 'b': np.array([7.5, 8.5]),  # top bar
+         'R': interior_R, 'w': interior_w},
+        {'a': np.array([7.5, 8.5]), 'b': np.array([7.5, 3.0]),  # right leg
+         'R': interior_R, 'w': interior_w},
     ]
 
     walls = boundary_walls + interior_walls
 
-    trajectory = run_simulation(x0, g, walls, alpha=0.05, n_steps=400)
+    trajectory = run_simulation(x0, g, walls, alpha=0.05, n_steps=800)
     plot_results(trajectory, x0, g, walls)
