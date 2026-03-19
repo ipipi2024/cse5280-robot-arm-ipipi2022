@@ -121,7 +121,7 @@ def total_gradient(x, g, walls):
 # 5. Simulation loop
 # ─────────────────────────────────────────────
 
-def run_simulation(x0, g, walls, alpha=0.000001, n_steps=5000):
+def run_simulation(x0, g, walls, alpha=0.001, n_steps=500):
     """
     Gradient descent:   x <- x - alpha * grad C(x)
 
@@ -183,12 +183,30 @@ if __name__ == "__main__":
     x0 = np.array([1.0, 1.0])
     g  = np.array([9.0, 9.0])
 
-    walls = [
+    # Outer square boundary [0,10]x[0,10] — same penalty framework as interior walls.
+    # The particle stays inside because crossing into the influence band (R) raises cost.
+    boundary_R = 1.0
+    boundary_w = 80.0
+    boundary_walls = [
+        {'a': np.array([ 0.0,  0.0]), 'b': np.array([10.0,  0.0]),  # bottom
+         'R': boundary_R, 'w': boundary_w},
+        {'a': np.array([10.0,  0.0]), 'b': np.array([10.0, 10.0]),  # right
+         'R': boundary_R, 'w': boundary_w},
+        {'a': np.array([10.0, 10.0]), 'b': np.array([ 0.0, 10.0]),  # top
+         'R': boundary_R, 'w': boundary_w},
+        {'a': np.array([ 0.0, 10.0]), 'b': np.array([ 0.0,  0.0]),  # left
+         'R': boundary_R, 'w': boundary_w},
+    ]
+
+    # Interior obstacle
+    interior_walls = [
         {'a': np.array([4.0, 2.0]),
          'b': np.array([4.0, 7.0]),
          'R': 1.5,
          'w': 80.0},
     ]
+
+    walls = boundary_walls + interior_walls
 
     trajectory = run_simulation(x0, g, walls, alpha=0.05, n_steps=400)
     plot_results(trajectory, x0, g, walls)
