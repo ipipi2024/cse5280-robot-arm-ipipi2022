@@ -2,10 +2,11 @@
 
 ## Overview
 
-A 2D particle simulation where particles navigate from start positions to a
-shared goal while avoiding wall obstacles inside a bounded room. Motion emerges
-purely from **cost minimisation** via gradient descent — there is no collision
-detection, no path-finding (no A*), and no hard "if hit wall then stop" logic.
+A 2D multi-particle simulation where particles navigate from start positions to
+a shared goal while avoiding wall obstacles inside a bounded room. Motion
+emerges purely from **cost minimisation** via gradient descent — there is no
+collision detection, no path-finding (no A*), and no hard "if hit wall then
+stop" logic.
 
 The environment consists of:
 - An **outer square boundary** `[0,10] × [0,10]` made of 4 wall segments
@@ -16,20 +17,23 @@ The goal is placed **inside** the n-shaped enclosure. Particles start from
 various positions **outside** the enclosure. The direct path to the goal is
 blocked by the enclosure walls, so each particle must detour around the outside
 and enter through the open bottom gap — behaviour that emerges entirely from
-the cost landscape, with no explicit routing rules.
+the cost landscape.
 
-Both single-particle and multi-particle modes are supported. In the
-multi-particle case each particle is simulated independently using the same
-cost function — there is no inter-particle repulsion.
+Two simulation modes are supported:
+- **Independent** — each particle only feels goal attraction and wall repulsion
+- **With pairwise repulsion** — particles additionally repel each other using
+  the same quadratic-band penalty framework, updated synchronously each step
 
 All gradients are derived analytically from first principles.
 
 ## Cost Function
 
-The total cost the particle minimises at each step is:
+The total cost for particle `i` is:
 
 ```
-C(x) = C_goal(x) + sum_i C_wall_i(x)
+C_i(x) = C_goal(x_i, g)
+        + sum over walls:       C_wall(x_i, wall)
+        + sum over j ≠ i:       C_repel(x_i, x_j)     ← only with repulsion enabled
 ```
 
 ### Goal term
@@ -40,37 +44,43 @@ C_goal(x) = 0.5 * ||x - g||²
 grad C_goal = x - g
 ```
 
-Descending this gradient pulls the particle toward goal `g`.
-
 ### Wall penalty term (per wall segment)
-
-Applies to every wall — boundary or interior — identically.
 
 ```
 C_wall(x) = 0.5 * w * (R - d(x))²   if d(x) < R
            = 0                         otherwise
-```
-
-where `d(x)` is the shortest distance from `x` to the wall segment `[a, b]`,
-`R` is the influence radius, and `w` is the penalty weight.
-
-**Analytic gradient via chain rule:**
-
-```
-dC_wall/dd  = -w * (R - d)           (outer derivative)
-dd/dx       = (x - p) / d            (gradient of Euclidean distance,
-                                       p = closest point on segment)
 
 grad C_wall = -w * (R - d) * (x - p) / max(d, eps)   if d < R
             = 0                                         otherwise
 ```
 
-The `max(d, eps)` guard prevents division by zero when the particle sits
-exactly on the wall.
+where `p` is the closest point on the segment to `x`.
+
+### Particle-particle repulsion term
+
+Same quadratic-band form as the wall penalty, applied to pairwise distances.
+
+```
+C_repel(xi, xj) = 0.5 * w_p * (R_p - d_ij)²   if d_ij < R_p
+                = 0                               otherwise
+
+where d_ij = ||xi - xj||
+```
+
+**Analytic gradient w.r.t. xi (chain rule — identical derivation to wall gradient):**
+
+```
+dC/d(d_ij)  = -w_p * (R_p - d_ij)          (outer derivative)
+d(d_ij)/dxi = (xi - xj) / d_ij             (gradient of Euclidean distance)
+
+grad_xi C_repel = -w_p * (R_p - d_ij) * (xi - xj) / max(d_ij, eps)   if d_ij < R_p
+                = 0                                                       otherwise
+```
+
+The direction pushes `xi` away from `xj`. By symmetry, the gradient w.r.t.
+`xj` is the negative — equal and opposite repulsion.
 
 ## Distance: Point to Segment
-
-The closest point `p` on segment `[a, b]` to point `x` is found by:
 
 ```
 t = dot(x - a, b - a) / dot(b - a, b - a)   # project onto line
@@ -79,10 +89,7 @@ p = a + t * (b - a)
 d = ||x - p||
 ```
 
-Clamping `t` handles the endpoint cases (before `a` or past `b`) automatically.
-The gradient formula `dd/dx = (x - p) / d` is valid in all cases.
-
-## Simulation Loop
+## Simulation Loops
 
 ### Single particle
 
@@ -90,17 +97,33 @@ The gradient formula `dd/dx = (x - p) / d` is valid in all cases.
 x = x - alpha * grad C(x)
 ```
 
-### Multiple particles
+### Multiple particles — independent
 
-```python
-for each start position x0:
+Each particle runs its own loop with no awareness of others:
+
+```
+for each x0 in starts:
     for each step:
-        if ||x - g|| < tol: break   # early stop on convergence
+        if ||x - g|| < tol: break
         x = x - alpha * total_gradient(x, g, walls)
 ```
 
-Each particle runs the same loop independently. No particle sees any other.
-The result is a list of trajectory arrays, one per particle.
+### Multiple particles — with pairwise repulsion (synchronous)
+
+```
+for each step:
+    snapshot = positions.copy()                    # 1. freeze current state
+    for each particle i:
+        grads[i] = total_gradient_with_particles(  # 2. compute from snapshot
+                       i, snapshot, g, walls, R_p, w_p)
+    for each particle i:
+        positions[i] -= alpha * grads[i]           # 3. apply all at once
+```
+
+**Why synchronous?** All gradients are computed from the same position snapshot
+before any particle moves. If particle 1 moved first, particle 2 would react to
+a position that didn't exist at the start of the step, breaking the physical
+symmetry of the pairwise repulsion.
 
 ## Environment Layout
 
@@ -117,32 +140,34 @@ The result is a list of trajectory arrays, one per particle.
 (0,0)──────────────────────────────(10,0)
 ```
 
-The direct path from any start outside the left leg to the goal crosses that
-leg. Each particle is repelled and must route around the outside before
-aligning with the gap and entering from below.
-
-## Multi-particle Start Positions
+## Particle Start Positions
 
 ```python
 starts = [
-    [2.0, 2.0],   # lower-left  — must go around the left leg
-    [8.0, 2.0],   # lower-right — must go around the right leg
+    [2.0, 2.0],   # lower-left   — must go around the left leg
+    [8.0, 2.0],   # lower-right  — must go around the right leg
     [5.5, 1.5],   # bottom-centre — aligned with the gap
     [1.5, 5.0],   # left side
     [8.5, 5.0],   # right side
 ]
 ```
 
-## Wall Parameters
+## Wall & Repulsion Parameters
 
-| Wall group     | `R`  | `w`   | Purpose |
-|----------------|------|-------|---------|
-| Boundary walls | 1.0  |  80.0 | Keep particles inside the room |
-| n-shape walls  | 1.0  | 120.0 | Force a full detour; prevent cutting through |
+| Parameter    | Value | Description |
+|--------------|-------|-------------|
+| `boundary_R` | 1.0   | Influence radius for outer boundary walls |
+| `boundary_w` | 80.0  | Penalty weight for outer boundary walls |
+| `interior_R` | 1.0   | Influence radius for n-shape walls |
+| `interior_w` | 120.0 | Penalty weight for n-shape walls (stronger to force detour) |
+| `R_p`        | 0.8   | Particle influence radius — repulsion activates when `d_ij < R_p` |
+| `w_p`        | 60.0  | Particle repulsion weight |
+
+**Tuning `R_p` and `w_p`:** too large `R_p` spreads particles so far apart they
+may not all fit through the gap; too large `w_p` prevents particles converging
+near the goal. Reduce `w_p` if particles are pushed away before reaching `tol`.
 
 ## Cost Field Visualisation
-
-A debug plot is produced alongside the trajectory plot:
 
 ```python
 plot_cost_field_and_vectors(x0, g, walls, trajectory=None, grid_n=60)
@@ -151,47 +176,30 @@ plot_cost_field_and_vectors(x0, g, walls, trajectory=None, grid_n=60)
 | Layer | What it shows |
 |-------|--------------|
 | `contourf` (plasma) | Total cost — bright = high (near walls, far from goal), dark = low (near goal). |
-| `quiver` (white arrows) | Negative gradient `−∇C(x)` — the direction gradient descent moves the particle. |
-| Cyan line | Actual trajectory overlaid on the field (when `trajectory` is passed). |
-
-**How to use it for debugging:**
-- Arrows near the bottom gap pointing inward and upward → cost corridor is viable.
-- Arrows pointing sideways or outward near the gap → wall `R` or `w` is too high; the gap is blocked.
-
-`grid_n` controls resolution: `40` is fast, `60` is the default, `80+` gives finer contours.
+| `quiver` (white arrows) | `−∇C(x)` — the direction gradient descent moves the particle. |
+| Cyan line | Actual trajectory overlaid (when `trajectory` is passed). |
 
 ## Project Structure
 
 ```
 main.py
-  goal_cost(x, g)                          — goal cost value
-  grad_goal(x, g)                          — analytic gradient of goal cost
-  point_to_segment(x, a, b)               — returns (d, p): distance + closest point
-  wall_cost(x, a, b, R, w)                — wall penalty value
-  grad_wall_penalty(x, a, b, R, w)        — analytic gradient of wall penalty
-  total_cost(x, g, walls)                 — combined cost
-  total_gradient(x, g, walls)             — combined analytic gradient
-  run_simulation(x0, g, walls, ...)       — single-particle gradient descent loop
-  run_multi_particle_simulation(...)      — N independent gradient descent loops
-  plot_results(trajectory, ...)           — single-particle trajectory plot
-  plot_multi_particle_results(...)        — all trajectories on one plot
-  plot_cost_field_and_vectors(x0, g, ...) — cost landscape + descent vector field
+  goal_cost(x, g)                                    — goal cost
+  grad_goal(x, g)                                    — analytic gradient of goal cost
+  point_to_segment(x, a, b)                          — distance + closest point on segment
+  wall_cost(x, a, b, R, w)                           — wall penalty value
+  grad_wall_penalty(x, a, b, R, w)                   — analytic gradient of wall penalty
+  total_cost(x, g, walls)                            — goal + wall costs
+  total_gradient(x, g, walls)                        — goal + wall gradients
+  particle_repulsion_cost(xi, xj, R_p, w_p)          — pairwise repulsion cost
+  grad_particle_repulsion(xi, xj, R_p, w_p)          — analytic gradient of repulsion
+  total_gradient_with_particles(i, positions, ...)   — goal + wall + repulsion gradient
+  run_simulation(x0, g, walls, ...)                  — single-particle loop
+  run_multi_particle_simulation(...)                 — N independent loops
+  run_multi_particle_simulation_with_repulsion(...)  — N synchronous loops with repulsion
+  plot_results(trajectory, ...)                      — single-particle plot
+  plot_multi_particle_results(trajectories, ...)     — all trajectories on one plot
+  plot_cost_field_and_vectors(x0, g, ...)            — cost landscape + vector field
 ```
-
-## Parameters
-
-| Parameter    | Description |
-|--------------|-------------|
-| `alpha`      | Step size (learning rate). Too large → overshoot; too small → slow. |
-| `n_steps`    | Maximum number of gradient descent iterations per particle. |
-| `tol`        | Convergence threshold — particle stops when `‖x − g‖ < tol`. |
-| `R`          | Wall influence radius. Repulsion activates when `d < R`. |
-| `w`          | Wall penalty weight. Higher = harder wall. |
-| `boundary_R` | Influence radius for the outer boundary walls. |
-| `boundary_w` | Penalty weight for the outer boundary walls. |
-| `interior_R` | Influence radius for the n-shape walls. |
-| `interior_w` | Penalty weight for the n-shape walls. |
-| `grid_n`     | Grid resolution for cost field visualisation. |
 
 ## Requirements
 
@@ -209,13 +217,13 @@ pip install numpy matplotlib
 python main.py
 ```
 
-Three windows open in sequence:
+Four windows open in sequence:
 
 1. **Single-particle trajectory** — one particle from `(2,2)` routing around
-   the n-shape to reach the goal at `(5.5, 7.0)`.
-
-2. **Cost field plot** — plasma cost landscape with white descent arrows and
-   the single-particle trajectory in cyan. Use this to debug the cost corridor.
-
-3. **Multi-particle trajectories** — all 5 particles shown together in
-   distinct colours, each routed independently through the same environment.
+   the n-shape to the goal at `(5.5, 7.0)`.
+2. **Cost field plot** — plasma cost landscape with descent arrows and the
+   single-particle trajectory in cyan.
+3. **Multi-particle (independent)** — all 5 particles, no inter-particle forces.
+4. **Multi-particle (with repulsion)** — all 5 particles with pairwise
+   quadratic-band repulsion, synchronous updates. Trajectories spread apart
+   as particles push each other away while converging to the goal.

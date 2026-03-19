@@ -140,7 +140,78 @@ def run_simulation(x0, g, walls, alpha=0.001, n_steps=500):
 
 
 # ─────────────────────────────────────────────
-# 6. Multi-particle simulation
+# 6. Particle-particle repulsion cost + gradient
+# ─────────────────────────────────────────────
+
+def particle_repulsion_cost(xi, xj, R_p, w_p):
+    """
+    Quadratic-band repulsion between two particles.
+
+    C_repel = 0.5 * w_p * (R_p - d)²   if d < R_p
+            = 0                          otherwise
+
+    where d = ||xi - xj||.
+
+    Same functional form as the wall penalty — just applied to the
+    distance between two particles instead of a point and a segment.
+    """
+    d = np.linalg.norm(xi - xj)
+    if d < R_p:
+        return 0.5 * w_p * (R_p - d) ** 2
+    return 0.0
+
+
+def grad_particle_repulsion(xi, xj, R_p, w_p):
+    """
+    Analytic gradient of C_repel with respect to xi.
+
+    Derivation (chain rule — identical structure to grad_wall_penalty):
+        d       = ||xi - xj||
+
+        dC/dd   = -w_p * (R_p - d)          (outer derivative)
+
+        dd/dxi  = (xi - xj) / d             (gradient of Euclidean distance)
+
+        grad_xi C_repel = -w_p * (R_p - d) * (xi - xj) / max(d, EPS)
+
+    Direction: points from xj toward xi, i.e. pushes xi away from xj.
+    By Newton's third law symmetry, the gradient w.r.t. xj is the negative.
+    """
+    d = np.linalg.norm(xi - xj)
+    if d >= R_p:
+        return np.zeros_like(xi)
+    return -w_p * (R_p - d) * (xi - xj) / max(d, EPS)
+
+
+def total_gradient_with_particles(i, positions, g, walls, R_p, w_p):
+    """
+    Full gradient for particle i, including inter-particle repulsion.
+
+    grad C_i = grad_goal(x_i, g)
+             + sum over all walls:  grad_wall_penalty(x_i, ...)
+             + sum over all j ≠ i:  grad_particle_repulsion(x_i, x_j, R_p, w_p)
+
+    Parameters
+    ----------
+    i         : index of the particle whose gradient we are computing
+    positions : (N, 2) array of current particle positions (snapshot)
+    g         : goal position
+    walls     : list of wall dicts
+    R_p       : particle influence radius
+    w_p       : particle repulsion weight
+    """
+    xi   = positions[i]
+    grad = total_gradient(xi, g, walls)          # goal + wall terms (existing)
+
+    for j, xj in enumerate(positions):           # add repulsion from every other particle
+        if j != i:
+            grad = grad + grad_particle_repulsion(xi, xj, R_p, w_p)
+
+    return grad
+
+
+# ─────────────────────────────────────────────
+# 7. Multi-particle simulation (independent)
 # ─────────────────────────────────────────────
 
 def run_multi_particle_simulation(starts, g, walls,
@@ -184,7 +255,79 @@ def run_multi_particle_simulation(starts, g, walls,
 
 
 # ─────────────────────────────────────────────
-# 7. Plotting
+# 8. Multi-particle simulation WITH repulsion
+# ─────────────────────────────────────────────
+
+def run_multi_particle_simulation_with_repulsion(starts, g, walls,
+                                                 alpha=0.05, n_steps=800,
+                                                 tol=0.05, R_p=0.8, w_p=60.0):
+    """
+    Gradient-descent simulation for N particles with pairwise repulsion.
+
+    Each step is **synchronous**:
+      1. Snapshot all current positions.
+      2. Compute every particle's gradient using that snapshot.
+      3. Apply all updates simultaneously.
+
+    Why synchronous?
+    ----------------
+    If we updated particle 1 first and then used its new position to compute
+    particle 2's gradient, particle 2 would react to a position that didn't
+    exist at the start of the step. This breaks the physical symmetry:
+    particle 1 pushes particle 2 based on position A, but particle 2 pushes
+    back based on position B (already moved). Synchronous updates ensure both
+    particles react to the same shared state.
+
+    Parameters
+    ----------
+    starts : (N, 2) array — one start position per particle
+    g      : shared goal position
+    walls  : list of wall dicts
+    alpha  : step size
+    n_steps: maximum steps
+    tol    : stop a particle when ||x - g|| < tol
+    R_p    : particle influence radius (repulsion activates when d < R_p)
+    w_p    : particle repulsion weight
+
+    Returns
+    -------
+    trajectories : list of N arrays, each (T_i, 2)
+    """
+    N = len(starts)
+    positions = np.array(starts, dtype=float)       # (N, 2) — current state
+    active    = np.ones(N, dtype=bool)              # True while particle still moving
+
+    # Store full trajectory for every particle
+    trajectories = [[p.copy()] for p in positions]
+
+    for _ in range(n_steps):
+        if not np.any(active):
+            break
+
+        # ── Step 1: snapshot ───────────────────────────────────────────────
+        snapshot = positions.copy()                 # all gradients read from here
+
+        # ── Step 2: compute all gradients from the snapshot ────────────────
+        grads = np.zeros_like(positions)
+        for i in range(N):
+            if active[i]:
+                grads[i] = total_gradient_with_particles(
+                    i, snapshot, g, walls, R_p, w_p
+                )
+
+        # ── Step 3: apply all updates simultaneously ───────────────────────
+        for i in range(N):
+            if active[i]:
+                positions[i] = positions[i] - alpha * grads[i]
+                trajectories[i].append(positions[i].copy())
+                if np.linalg.norm(positions[i] - g) < tol:
+                    active[i] = False               # this particle has converged
+
+    return [np.array(t) for t in trajectories]
+
+
+# ─────────────────────────────────────────────
+# 9. Plotting
 # ─────────────────────────────────────────────
 
 def plot_results(trajectory, x0, g, walls):
@@ -220,10 +363,10 @@ def plot_results(trajectory, x0, g, walls):
 
 
 # ─────────────────────────────────────────────
-# 8. Multi-particle plot
+# 10. Multi-particle plot
 # ─────────────────────────────────────────────
 
-def plot_multi_particle_results(trajectories, starts, g, walls):
+def plot_multi_particle_results(trajectories, starts, g, walls, repulsion=False):
     """
     Plot all particle trajectories together on one axes.
 
@@ -270,14 +413,14 @@ def plot_multi_particle_results(trajectories, starts, g, walls):
     ax.set_ylim(0, 10)
     ax.set_aspect('equal')
     ax.set_title(f"Multi-particle gradient descent  (N={len(trajectories)})\n"
-                 "Each particle simulated independently — no inter-particle forces")
+                 f"{'Inter-particle repulsion enabled' if repulsion else 'Each particle simulated independently — no inter-particle forces'}")
     ax.grid(True, linestyle='--', alpha=0.4)
     plt.tight_layout()
     plt.show()
 
 
 # ─────────────────────────────────────────────
-# 9. Cost field + gradient vector visualisation
+# 11. Cost field + gradient vector visualisation
 # ─────────────────────────────────────────────
 
 def plot_cost_field_and_vectors(x0, g, walls, trajectory=None, grid_n=60):
@@ -366,7 +509,7 @@ def plot_cost_field_and_vectors(x0, g, walls, trajectory=None, grid_n=60):
 
 
 # ─────────────────────────────────────────────
-# 10. Main
+# 12. Main
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -424,7 +567,15 @@ if __name__ == "__main__":
         [8.5, 5.0],   # right side
     ])
 
+    # Independent (no repulsion)
     trajectories = run_multi_particle_simulation(
         starts, g, walls, alpha=0.05, n_steps=800, tol=0.05
     )
-    plot_multi_particle_results(trajectories, starts, g, walls)
+    plot_multi_particle_results(trajectories, starts, g, walls, repulsion=False)
+
+    # With pairwise repulsion — synchronous updates, same walls and goal
+    trajectories_repel = run_multi_particle_simulation_with_repulsion(
+        starts, g, walls, alpha=0.05, n_steps=800, tol=0.05,
+        R_p=0.8, w_p=60.0
+    )
+    plot_multi_particle_results(trajectories_repel, starts, g, walls, repulsion=True)
