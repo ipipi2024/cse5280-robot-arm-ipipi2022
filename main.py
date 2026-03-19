@@ -140,7 +140,51 @@ def run_simulation(x0, g, walls, alpha=0.001, n_steps=500):
 
 
 # ─────────────────────────────────────────────
-# 6. Plotting
+# 6. Multi-particle simulation
+# ─────────────────────────────────────────────
+
+def run_multi_particle_simulation(starts, g, walls,
+                                  alpha=0.05, n_steps=800, tol=0.05):
+    """
+    Run independent gradient-descent simulations for N particles.
+
+    Each particle sees the same walls and goal and is simulated separately —
+    no particle-particle interaction of any kind.
+
+    Parameters
+    ----------
+    starts  : (N, 2) array or list of 2-element arrays — one start per particle
+    g       : goal position shared by all particles
+    walls   : list of wall dicts (same format as single-particle version)
+    alpha   : gradient descent step size
+    n_steps : maximum number of steps per particle
+    tol     : early-stop when ||x - g|| < tol (particle has reached the goal)
+
+    Returns
+    -------
+    trajectories : list of N arrays, each of shape (T_i, 2)
+                   T_i may be shorter than n_steps+1 if the particle converged.
+    """
+    trajectories = []
+
+    for x0 in starts:
+        x = np.array(x0, dtype=float)
+        traj = [x.copy()]
+
+        for _ in range(n_steps):
+            if np.linalg.norm(x - g) < tol:
+                break                          # particle reached the goal
+            grad = total_gradient(x, g, walls)
+            x = x - alpha * grad
+            traj.append(x.copy())
+
+        trajectories.append(np.array(traj))
+
+    return trajectories
+
+
+# ─────────────────────────────────────────────
+# 7. Plotting
 # ─────────────────────────────────────────────
 
 def plot_results(trajectory, x0, g, walls):
@@ -176,7 +220,64 @@ def plot_results(trajectory, x0, g, walls):
 
 
 # ─────────────────────────────────────────────
-# 7. Cost field + gradient vector visualisation
+# 8. Multi-particle plot
+# ─────────────────────────────────────────────
+
+def plot_multi_particle_results(trajectories, starts, g, walls):
+    """
+    Plot all particle trajectories together on one axes.
+
+    Parameters
+    ----------
+    trajectories : list of (T_i, 2) arrays returned by run_multi_particle_simulation
+    starts       : (N, 2) array or list used as start positions
+    g            : goal position
+    walls        : list of wall dicts
+    """
+    # One colour per particle, cycling through a qualitative palette
+    colours = plt.cm.tab10(np.linspace(0, 1, max(len(trajectories), 1)))
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    for i, traj in enumerate(trajectories):
+        colour = colours[i % len(colours)]
+        ax.plot(traj[:, 0], traj[:, 1], color=colour, linewidth=1.4,
+                alpha=0.85, zorder=2)
+        # Mark each start with a small filled circle in the same colour
+        ax.scatter(*traj[0], color=colour, edgecolors='black',
+                   s=80, zorder=5, linewidths=0.8)
+
+    # Goal
+    ax.scatter(*g, color='red', s=140, zorder=6, marker='*')
+
+    # Walls
+    for wall in walls:
+        ax.plot([wall['a'][0], wall['b'][0]],
+                [wall['a'][1], wall['b'][1]],
+                color='black', linewidth=3, zorder=4)
+
+    legend_handles = [
+        Line2D([0], [0], color='steelblue', linewidth=1.4,
+               label=f'Particle trajectories (N={len(trajectories)})'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='steelblue',
+               markeredgecolor='black', markersize=9, label='Start positions'),
+        Line2D([0], [0], marker='*', color='w', markerfacecolor='red',
+               markersize=14, label='Goal'),
+        Line2D([0], [0], color='black', linewidth=3, label='Wall'),
+    ]
+    ax.legend(handles=legend_handles)
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.set_aspect('equal')
+    ax.set_title(f"Multi-particle gradient descent  (N={len(trajectories)})\n"
+                 "Each particle simulated independently — no inter-particle forces")
+    ax.grid(True, linestyle='--', alpha=0.4)
+    plt.tight_layout()
+    plt.show()
+
+
+# ─────────────────────────────────────────────
+# 9. Cost field + gradient vector visualisation
 # ─────────────────────────────────────────────
 
 def plot_cost_field_and_vectors(x0, g, walls, trajectory=None, grid_n=60):
@@ -265,18 +366,13 @@ def plot_cost_field_and_vectors(x0, g, walls, trajectory=None, grid_n=60):
 
 
 # ─────────────────────────────────────────────
-# 8. Main
+# 10. Main
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Start is outside and offset so the direct path to the goal is blocked
-    # by the left leg of the n-shape.  The particle must go around the outside
-    # and enter through the open bottom gap.
-    x0 = np.array([2.0, 2.0])
-    g  = np.array([5.5, 7.0])
+    g = np.array([5.5, 7.0])   # goal — inside the n-shaped enclosure
 
     # ── Outer square boundary [0,10]×[0,10] ──────────────────────────────────
-    # Same penalty framework as every other wall — no special boundary logic.
     boundary_R = 1.0
     boundary_w = 80.0
     boundary_walls = [
@@ -298,14 +394,6 @@ if __name__ == "__main__":
     #      │                     │
     #   (3.5,3.0)           (7.5,3.0)    ← open bottom gap  (y < 3.0)
     #
-    # Legs reach down to y=3.0 — well below the goal at y=7.0.
-    # The gap width is 4 units (x: 3.5→7.5).  With R=1.0 the influence bands
-    # consume 1 unit on each side, leaving ~2 units of navigable gap width.
-    #
-    # Start (2.0, 2.0) is to the lower-left.  The direct path to the goal
-    # crosses the left leg, so the particle is forced to detour around the
-    # outside of the n-shape and enter through the bottom opening.
-    #
     interior_R = 1.0
     interior_w = 120.0
     interior_walls = [
@@ -319,9 +407,24 @@ if __name__ == "__main__":
 
     walls = boundary_walls + interior_walls
 
+    # ── Single-particle run (kept for reference + cost-field debug) ───────────
+    x0 = np.array([2.0, 2.0])
     trajectory = run_simulation(x0, g, walls, alpha=0.05, n_steps=800)
     plot_results(trajectory, x0, g, walls)
-
-    # Debug: show the cost landscape and descent vectors, with trajectory overlaid.
-    # Use a coarser grid (grid_n=40) for speed, or increase to 80+ for detail.
     plot_cost_field_and_vectors(x0, g, walls, trajectory=trajectory, grid_n=60)
+
+    # ── Multi-particle run ────────────────────────────────────────────────────
+    # Particles start from different positions around the n-shape.
+    # Each is simulated independently — same walls, same goal, no interaction.
+    starts = np.array([
+        [2.0, 2.0],   # lower-left  (must go around left leg)
+        [8.0, 2.0],   # lower-right (must go around right leg)
+        [5.5, 1.5],   # bottom-centre (aligned with the gap)
+        [1.5, 5.0],   # left side
+        [8.5, 5.0],   # right side
+    ])
+
+    trajectories = run_multi_particle_simulation(
+        starts, g, walls, alpha=0.05, n_steps=800, tol=0.05
+    )
+    plot_multi_particle_results(trajectories, starts, g, walls)
