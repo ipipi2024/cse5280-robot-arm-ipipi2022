@@ -5,6 +5,7 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 from matplotlib.lines import Line2D
 from matplotlib.patches import Circle
 
@@ -503,3 +504,142 @@ def plot_evacuation_with_robot_arm(trajectories, ee_traj, arm_angles_log,
     ax.grid(True, linestyle='--', alpha=0.4)
     plt.tight_layout()
     plt.show()
+
+
+# ─────────────────────────────────────────────
+# Animation — evacuation with IK arm or point robot
+# ─────────────────────────────────────────────
+
+def animate_evacuation(trajectories, exits, walls,
+                       ee_traj=None,
+                       arm_angles_log=None, arm_base=None, arm_lengths=None,
+                       predicted_target_log=None,
+                       interval=30,
+                       title="Evacuation Animation"):
+    """
+    Animate an evacuation simulation using pre-computed trajectory data.
+
+    Static background: walls, exits, faded full trajectory trails.
+    Animated foreground: particle dots, end-effector, arm links (optional),
+                         predicted target marker (optional).
+
+    Parameters
+    ----------
+    trajectories        : list of N arrays (T_i, 2) — particle paths
+    exits               : (K, 2) exit positions
+    walls               : list of wall dicts with 'a', 'b', 'R', 'w'
+    ee_traj             : (T, 2) end-effector positions, or None
+    arm_angles_log      : list of [θ1, θ2] per step, or None
+    arm_base            : (2,) fixed arm root, or None
+    arm_lengths         : [L1, L2], or None
+    predicted_target_log: list of (2,) or None per step, or None
+    interval            : milliseconds between frames
+    title               : axes title string
+
+    Returns
+    -------
+    anim : FuncAnimation object  ← keep a reference; garbage collection stops it
+    """
+    N        = len(trajectories)
+    n_frames = max(len(t) for t in trajectories)
+    colours  = plt.cm.hsv(np.linspace(0, 0.85, max(N, 1)))
+    exits    = np.array(exits)
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.set_aspect('equal')
+    ax.set_title(title)
+    ax.grid(True, linestyle='--', alpha=0.4)
+
+    # ── static: walls ────────────────────────────────────────────────────────
+    for wall in walls:
+        ax.plot([wall['a'][0], wall['b'][0]],
+                [wall['a'][1], wall['b'][1]],
+                color='black', linewidth=3, zorder=4)
+
+    # ── static: exits ────────────────────────────────────────────────────────
+    for k, ex in enumerate(exits):
+        ax.scatter(*ex, color='lime', s=200, zorder=8,
+                   marker='*', edgecolors='black', linewidths=0.8)
+        ax.annotate(f'Exit {k+1}', xy=ex,
+                    xytext=(ex[0] + 0.15, ex[1] + 0.15),
+                    fontsize=9, color='darkgreen', fontweight='bold')
+
+    # ── static: faded full trajectory trails ─────────────────────────────────
+    for i, traj in enumerate(trajectories):
+        ax.plot(traj[:, 0], traj[:, 1],
+                color=colours[i], linewidth=0.6, alpha=0.18, zorder=1)
+
+    # ── animated: particle dots ───────────────────────────────────────────────
+    init_xy = np.array([[t[0, 0], t[0, 1]] for t in trajectories])
+    particle_scat = ax.scatter(init_xy[:, 0], init_xy[:, 1],
+                               c=colours, s=40, zorder=6,
+                               edgecolors='black', linewidths=0.4)
+
+    # ── animated: end-effector marker ────────────────────────────────────────
+    ee_artist = None
+    if ee_traj is not None:
+        ee_traj = np.array(ee_traj)
+        ee_artist, = ax.plot([], [], 'X', color='magenta', markersize=12,
+                             zorder=9, markeredgecolor='black',
+                             markeredgewidth=0.8, label='End-effector')
+
+    # ── animated: arm links (two segments) ───────────────────────────────────
+    arm_line1 = arm_line2 = None
+    if arm_angles_log is not None and arm_base is not None and arm_lengths is not None:
+        arm_line1, = ax.plot([], [], color='darkred', linewidth=2.5, zorder=7)
+        arm_line2, = ax.plot([], [], color='darkred', linewidth=2.5, zorder=7)
+
+    # ── animated: predicted target diamond ───────────────────────────────────
+    pred_artist = None
+    if predicted_target_log is not None:
+        pred_artist, = ax.plot([], [], 'D', color='orangered', markersize=8,
+                               zorder=7, markeredgecolor='black',
+                               markeredgewidth=0.5, label='Predicted target')
+
+    # ── step counter ──────────────────────────────────────────────────────────
+    time_text = ax.text(0.02, 0.96, '', transform=ax.transAxes,
+                        fontsize=9, verticalalignment='top')
+
+    def update(frame):
+        # particles — hold at last position once trajectory ends
+        xy = np.array([[t[min(frame, len(t) - 1), 0],
+                        t[min(frame, len(t) - 1), 1]]
+                       for t in trajectories])
+        particle_scat.set_offsets(xy)
+
+        if ee_artist is not None:
+            f = min(frame, len(ee_traj) - 1)
+            ee_artist.set_data([ee_traj[f, 0]], [ee_traj[f, 1]])
+
+        if arm_line1 is not None:
+            f = min(frame, len(arm_angles_log) - 1)
+            joints = arm_forward_kinematics(
+                np.array(arm_base), arm_angles_log[f], arm_lengths)
+            arm_line1.set_data([joints[0][0], joints[1][0]],
+                               [joints[0][1], joints[1][1]])
+            arm_line2.set_data([joints[1][0], joints[2][0]],
+                               [joints[1][1], joints[2][1]])
+
+        if pred_artist is not None:
+            f = min(frame, len(predicted_target_log) - 1)
+            p = predicted_target_log[f]
+            if p is not None:
+                pred_artist.set_data([p[0]], [p[1]])
+            else:
+                pred_artist.set_data([], [])
+
+        time_text.set_text(f'Step {frame}/{n_frames - 1}')
+
+        artists = [particle_scat, time_text]
+        if ee_artist   is not None: artists.append(ee_artist)
+        if arm_line1   is not None: artists += [arm_line1, arm_line2]
+        if pred_artist is not None: artists.append(pred_artist)
+        return artists
+
+    anim = FuncAnimation(fig, update, frames=n_frames,
+                         interval=interval, blit=True)
+    plt.tight_layout()
+    plt.show()
+    return anim

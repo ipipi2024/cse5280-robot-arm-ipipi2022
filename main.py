@@ -19,6 +19,7 @@ from visualization import (
     plot_cost_field_and_vectors,
     plot_evacuation_with_robot,
     plot_evacuation_with_robot_arm,
+    animate_evacuation,
 )
 
 
@@ -214,4 +215,17 @@ if __name__ == "__main__":
         dominant_centroid_log=arm_dominant_log,
         smoothed_centroid_log=arm_smoothed_log,
         predicted_target_log=arm_predicted_log,
+    )
+
+    # ── Animation: Phase 4 IK arm ─────────────────────────────────────────────
+    # Assign to a variable — FuncAnimation stops if the object is garbage-collected
+    anim = animate_evacuation(
+        arm_trajs, exits, evac_walls,
+        ee_traj=ee_traj,
+        arm_angles_log=arm_angles_log,
+        arm_base=arm_base,
+        arm_lengths=arm_lengths,
+        predicted_target_log=arm_predicted_log,
+        interval=30,
+        title="Phase 4 — IK arm evacuation (animated)",
     )
