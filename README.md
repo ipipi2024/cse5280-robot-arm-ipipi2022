@@ -7,13 +7,14 @@ toward goal(s) while avoiding wall obstacles inside a bounded room. Motion
 emerges purely from **cost minimisation** via gradient descent — there is no
 collision detection, no path-finding (no A*), and no hard routing logic.
 
-Three simulation modes are supported:
+Four simulation modes are supported:
 
-| Mode | Goal term | Repulsion |
-|------|-----------|-----------|
-| Independent | Single goal | No |
-| Pairwise repulsion | Single goal | Yes, synchronous |
-| Evacuation (soft-min) | Two exits via soft-min | Yes, synchronous |
+| Mode | Goal term | Repulsion | Robot |
+|------|-----------|-----------|-------|
+| Independent | Single goal | No | No |
+| Pairwise repulsion | Single goal | Yes, synchronous | No |
+| Evacuation (soft-min) | Two exits via soft-min | Yes, synchronous | No |
+| Phase 1 — robot interference | Two exits via soft-min | Yes, synchronous | Yes |
 
 All gradients are derived analytically from first principles.
 
@@ -191,6 +192,73 @@ Uniform random in `x∈[1,9], y∈[3,9]`.
 high values (≈10+) approach a hard switch and may introduce gradient instability
 near the indifference surface.
 
+## Phase 1 — Robot Interference Agent
+
+### Concept
+
+The robot is a **moving point obstacle** in the same 2D environment. It has no
+arms, no IK, no clustering, and no prediction — this is intentionally the
+minimal baseline. The robot:
+
+1. Detects particles that are currently near an exit (within `detection_radius`)
+2. Moves toward the centroid of those particles (proportional control)
+3. Is felt by all particles as a dynamic repulsive obstacle
+
+Particles treat the robot exactly like they treat each other or a wall —
+via the same quadratic-band cost, no special rules.
+
+### Robot obstacle cost + gradient
+
+```
+d         = ||x - robot_pos||
+
+C_robot   = 0.5 * w_robot * (R_robot - d)²   if d < R_robot,   else 0
+
+grad_xi C_robot = -w_robot * (R_robot - d) * (x - robot_pos) / max(d, eps)
+```
+
+Identical derivation to the particle repulsion term. The robot position is
+fixed for the full step (read before any particle moves), consistent with
+synchronous updates.
+
+### Robot motion
+
+```
+target    = mean position of active particles within detection_radius of any exit
+           (if none detected, hold previous target)
+
+robot_pos = robot_pos + robot_alpha * (target - robot_pos)
+```
+
+### Per-step order
+
+```
+1. detect near-exit particles  →  update robot target
+2. move robot (proportional)
+3. snapshot particle positions
+4. compute all gradients from snapshot:
+       soft-min goal + walls + inter-particle repulsion + robot repulsion
+5. apply all particle updates simultaneously
+```
+
+### Why this is a valid Phase 1 baseline
+
+The robot reacts only to where particles **currently are** near exits — no
+grouping of flow streams, no forecasting of future positions, no arm
+kinematics. It is physically meaningful (it interferes with the highest-density
+evacuation flow) while remaining the simplest possible extension. Clustering,
+prediction, and IK can all be layered on top without changing this core loop.
+
+### Robot parameters
+
+| Parameter          | Value | Description |
+|--------------------|-------|-------------|
+| `robot_start`      | [5,5] | Initial robot position (room centre) |
+| `robot_alpha`      | 0.08  | Proportional gain toward target |
+| `detection_radius` | 2.0   | Radius around each exit for flow detection |
+| `R_robot`          | 0.9   | Robot obstacle influence radius |
+| `w_robot`          | 50.0  | Robot obstacle penalty weight |
+
 ## Cost Field Visualisation
 
 ```python
@@ -224,10 +292,16 @@ main.py
   run_simulation(x0, g, walls, ...)                      — single-particle loop
   run_multi_particle_simulation(...)                     — N independent loops
   run_multi_particle_simulation_with_repulsion(...)      — N synchronous loops
-  run_evacuation_simulation(starts, exits, walls, ...)   — soft-min evacuation loop
-  plot_results(trajectory, ...)                          — single-particle plot
-  plot_multi_particle_results(trajectories, ..., exits)  — all trajectories + exits
-  plot_cost_field_and_vectors(x0, g, ...)                — cost landscape + vectors
+  run_evacuation_simulation(starts, exits, walls, ...)        — soft-min evacuation loop
+  robot_obstacle_cost(x, robot_pos, R_robot, w_robot)         — robot point obstacle cost
+  grad_robot_obstacle(x, robot_pos, R_robot, w_robot)         — analytic robot gradient
+  find_particles_near_exits(positions, active, exits, radius) — detect near-exit flow
+  update_robot_target(positions, active, exits, radius, prev) — centroid of detected flow
+  run_evacuation_with_robot_phase1(...)                       — Phase 1 simulation loop
+  plot_results(trajectory, ...)                               — single-particle plot
+  plot_multi_particle_results(trajectories, ..., exits)       — all trajectories + exits
+  plot_cost_field_and_vectors(x0, g, ...)                     — cost landscape + vectors
+  plot_evacuation_with_robot(trajs, robot_traj, ...)          — Phase 1 visualisation
 ```
 
 ## Requirements
@@ -246,7 +320,7 @@ pip install numpy matplotlib
 python main.py
 ```
 
-Five windows open in sequence:
+Six windows open in sequence:
 
 1. **Single-particle trajectory** — one particle from `(2,2)` routing around
    the n-shape to the single goal.
@@ -258,3 +332,7 @@ Five windows open in sequence:
 5. **Evacuation (soft-min)** — 25 particles in an open room with two exits.
    Each particle smoothly steers toward the cheaper exit; repulsion spreads
    load across both exits without any explicit assignment logic.
+6. **Phase 1 — robot interference** — same open room and exits. A robot point
+   starts at `(5,5)`, detects particles accumulating near exits, and moves to
+   intercept. Particles treat the robot as a dynamic obstacle. Robot trajectory
+   shown as dashed magenta; target trail shown as grey dots.

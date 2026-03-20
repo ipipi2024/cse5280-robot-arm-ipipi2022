@@ -705,8 +705,294 @@ def plot_cost_field_and_vectors(x0, g, walls, trajectory=None, grid_n=60):
     plt.show()
 
 
+# ═════════════════════════════════════════════
+# PHASE 1 — Robot interference agent
+# ═════════════════════════════════════════════
+#
+# Why this is a valid Phase 1 baseline:
+#   The robot is represented as a moving point obstacle.  Particles
+#   already treat walls and each other as repulsion sources via the same
+#   quadratic-band cost; adding the robot just plugs into that same
+#   framework.  The robot tracks where evacuation flow is accumulating
+#   near exits and moves there proportionally — a minimal but physically
+#   meaningful interference strategy that can be extended later with
+#   clustering, prediction, and inverse kinematics.
+
 # ─────────────────────────────────────────────
-# 14. Main
+# 14. Robot obstacle cost + analytic gradient
+# ─────────────────────────────────────────────
+
+def robot_obstacle_cost(x, robot_pos, R_robot, w_robot):
+    """
+    Quadratic-band repulsion from the robot end-effector.
+
+    Identical in form to particle_repulsion_cost — the robot is simply
+    treated as a dynamic obstacle whose position updates each timestep.
+
+        d        = ||x - robot_pos||
+        C_robot  = 0.5 * w_robot * (R_robot - d)^2   if d < R_robot
+                 = 0                                   otherwise
+    """
+    d = np.linalg.norm(x - robot_pos)
+    if d < R_robot:
+        return 0.5 * w_robot * (R_robot - d) ** 2
+    return 0.0
+
+
+def grad_robot_obstacle(x, robot_pos, R_robot, w_robot):
+    """
+    Analytic gradient of C_robot w.r.t. particle position x.
+
+    Derivation — same chain rule as grad_particle_repulsion:
+        dC/dd  = -w_robot * (R_robot - d)
+        dd/dx  = (x - robot_pos) / d
+
+        grad = -w_robot * (R_robot - d) * (x - robot_pos) / max(d, EPS)
+
+    Pushes the particle away from the robot point.
+    """
+    d = np.linalg.norm(x - robot_pos)
+    if d >= R_robot:
+        return np.zeros_like(x)
+    return -w_robot * (R_robot - d) * (x - robot_pos) / max(d, EPS)
+
+
+# ─────────────────────────────────────────────
+# 15. Robot detection and targeting
+# ─────────────────────────────────────────────
+
+def find_particles_near_exits(positions, active, exits, detection_radius):
+    """
+    Return indices of active particles within detection_radius of any exit.
+
+    Parameters
+    ----------
+    positions        : (N, 2) current particle positions
+    active           : (N,) bool array — False for particles that converged
+    exits            : (K, 2) exit positions
+    detection_radius : scalar — detection radius around each exit
+
+    Returns
+    -------
+    indices : list of ints — particles currently flowing near exits
+    """
+    indices = []
+    for i in range(len(positions)):
+        if not active[i]:
+            continue
+        dist_to_any_exit = np.min(np.linalg.norm(exits - positions[i], axis=1))
+        if dist_to_any_exit < detection_radius:
+            indices.append(i)
+    return indices
+
+
+def update_robot_target(positions, active, exits, detection_radius, prev_target):
+    """
+    Compute the robot's new target position.
+
+    Strategy: move toward the mean position of particles currently near
+    exits.  If no particles are detected, hold the previous target so the
+    robot doesn't drift away.
+
+    Parameters
+    ----------
+    positions        : (N, 2) current positions
+    active           : (N,) bool array
+    exits            : (K, 2) exit positions
+    detection_radius : float
+    prev_target      : (2,) last known target (used as fallback)
+
+    Returns
+    -------
+    target : (2,) new robot target position
+    """
+    near = find_particles_near_exits(positions, active, exits, detection_radius)
+    if len(near) == 0:
+        return prev_target                          # no flow detected — hold
+    return np.mean(positions[near], axis=0)         # centroid of near-exit flow
+
+
+# ─────────────────────────────────────────────
+# 16. Evacuation simulation with robot (Phase 1)
+# ─────────────────────────────────────────────
+
+def run_evacuation_with_robot_phase1(starts, exits, walls, beta=4.0,
+                                     alpha=0.04, n_steps=1000, tol=0.15,
+                                     R_p=0.6, w_p=30.0,
+                                     robot_start=None,
+                                     robot_alpha=0.08,
+                                     detection_radius=2.0,
+                                     R_robot=0.9, w_robot=50.0):
+    """
+    Evacuation simulation with a Phase 1 robot interference agent.
+
+    Each timestep:
+      a. detect active particles near exits
+      b. update robot target (centroid of detected flow)
+      c. move robot toward target proportionally
+      d. compute all particle gradients from snapshot (synchronous):
+           soft-min exit attraction
+         + wall repulsion
+         + inter-particle repulsion
+         + robot obstacle repulsion   ← NEW
+      e. update all particle positions
+
+    Parameters
+    ----------
+    robot_start      : (2,) initial robot position.  Defaults to room centre.
+    robot_alpha      : robot movement speed toward target (proportional gain)
+    detection_radius : radius around each exit that counts as "near exit"
+    R_robot          : robot obstacle influence radius
+    w_robot          : robot obstacle penalty weight
+
+    Returns
+    -------
+    trajectories   : list of N arrays (T_i, 2) — particle paths
+    robot_traj     : (n_steps, 2) array — robot position at each step
+    robot_targets  : (n_steps, 2) array — robot target at each step
+    """
+    exits     = np.array(exits)
+    N         = len(starts)
+    positions = np.array(starts, dtype=float)
+    active    = np.ones(N, dtype=bool)
+    trajs     = [[p.copy()] for p in positions]
+
+    # Robot state
+    robot_pos    = np.array(robot_start if robot_start is not None
+                            else [5.0, 5.0], dtype=float)
+    robot_target = robot_pos.copy()
+    robot_traj   = [robot_pos.copy()]
+    robot_targets_log = [robot_target.copy()]
+
+    for _ in range(n_steps):
+        if not np.any(active):
+            break
+
+        # ── a. Detect flow near exits ──────────────────────────────────────
+        robot_target = update_robot_target(
+            positions, active, exits, detection_radius, robot_target
+        )
+
+        # ── b. Move robot toward target (proportional control) ────────────
+        robot_pos = robot_pos + robot_alpha * (robot_target - robot_pos)
+
+        # ── c. Snapshot all positions for synchronous gradient computation ─
+        snapshot = positions.copy()
+
+        # ── d. Compute gradients (soft-min goal + walls + repulsion + robot)─
+        grads = np.zeros_like(positions)
+        for i in range(N):
+            if active[i]:
+                xi = snapshot[i]
+                # Existing terms: soft-min goal + walls + inter-particle
+                grads[i] = total_gradient_with_particles_softmin(
+                    i, snapshot, exits, walls, R_p, w_p, beta
+                )
+                # New term: robot as dynamic obstacle
+                grads[i] = grads[i] + grad_robot_obstacle(
+                    xi, robot_pos, R_robot, w_robot
+                )
+
+        # ── e. Update all particles simultaneously ─────────────────────────
+        for i in range(N):
+            if active[i]:
+                positions[i] = positions[i] - alpha * grads[i]
+                trajs[i].append(positions[i].copy())
+                if np.min(np.linalg.norm(exits - positions[i], axis=1)) < tol:
+                    active[i] = False
+
+        robot_traj.append(robot_pos.copy())
+        robot_targets_log.append(robot_target.copy())
+
+    return ([np.array(t) for t in trajs],
+            np.array(robot_traj),
+            np.array(robot_targets_log))
+
+
+# ─────────────────────────────────────────────
+# 17. Phase 1 visualisation
+# ─────────────────────────────────────────────
+
+def plot_evacuation_with_robot(trajectories, robot_traj, robot_targets,
+                               starts, exits, walls):
+    """
+    Plot the Phase 1 evacuation scene:
+      - particle trajectories (hsv colour per particle)
+      - start markers (same colour, black edge)
+      - exit markers (lime stars, labelled)
+      - robot trajectory (dashed magenta)
+      - robot final position (magenta X)
+      - robot target trail (small grey dots, optional)
+      - walls (black)
+    """
+    N       = len(trajectories)
+    colours = plt.cm.hsv(np.linspace(0, 0.85, max(N, 1)))
+
+    fig, ax = plt.subplots(figsize=(9, 9))
+
+    # Particle trajectories + start markers
+    for i, traj in enumerate(trajectories):
+        c = colours[i % len(colours)]
+        ax.plot(traj[:, 0], traj[:, 1], color=c,
+                linewidth=0.9, alpha=0.7, zorder=2)
+        ax.scatter(*traj[0], color=c, edgecolors='black',
+                   s=45, zorder=5, linewidths=0.6)
+
+    # Robot trajectory
+    ax.plot(robot_traj[:, 0], robot_traj[:, 1],
+            color='magenta', linewidth=1.6, linestyle='--',
+            zorder=6, label='Robot trajectory')
+    # Robot final position
+    ax.scatter(*robot_traj[-1], color='magenta', marker='X',
+               s=160, zorder=7, edgecolors='black', linewidths=0.8,
+               label='Robot (final)')
+    # Robot target trail
+    ax.scatter(robot_targets[:, 0], robot_targets[:, 1],
+               color='grey', s=6, alpha=0.4, zorder=3,
+               label='Robot target trail')
+
+    # Exits
+    for k, ex in enumerate(exits):
+        ax.scatter(*ex, color='lime', s=200, zorder=8,
+                   marker='*', edgecolors='black', linewidths=0.8)
+        ax.annotate(f'Exit {k+1}', xy=ex,
+                    xytext=(ex[0] + 0.15, ex[1] + 0.15),
+                    fontsize=9, color='darkgreen', fontweight='bold')
+
+    # Walls
+    for wall in walls:
+        ax.plot([wall['a'][0], wall['b'][0]],
+                [wall['a'][1], wall['b'][1]],
+                color='black', linewidth=3, zorder=4)
+
+    legend_handles = [
+        Line2D([0], [0], color='grey', linewidth=0.9,
+               label=f'Particle trajectories (N={N})'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
+               markeredgecolor='black', markersize=7, label='Starts'),
+        Line2D([0], [0], marker='*', color='w', markerfacecolor='lime',
+               markeredgecolor='black', markersize=13, label='Exits'),
+        Line2D([0], [0], color='magenta', linewidth=1.6,
+               linestyle='--', label='Robot trajectory'),
+        Line2D([0], [0], marker='X', color='w', markerfacecolor='magenta',
+               markeredgecolor='black', markersize=11, label='Robot (final)'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
+               markersize=5, alpha=0.5, label='Robot target trail'),
+        Line2D([0], [0], color='black', linewidth=3, label='Wall'),
+    ]
+    ax.legend(handles=legend_handles, loc='upper right', fontsize=8)
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.set_aspect('equal')
+    ax.set_title(f"Phase 1 — Robot interference agent  (N={N})\n"
+                 "Robot tracks near-exit flow and acts as a dynamic obstacle")
+    ax.grid(True, linestyle='--', alpha=0.4)
+    plt.tight_layout()
+    plt.show()
+
+
+# ─────────────────────────────────────────────
+# 18. Main
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -825,4 +1111,30 @@ if __name__ == "__main__":
     plot_multi_particle_results(
         evac_trajectories, evac_starts, g=None, walls=evac_walls,
         repulsion=True, exits=exits
+    )
+
+    # ── Phase 1: evacuation with robot interference ───────────────────────────
+    # Same scene as the soft-min evacuation above (open room, two exits).
+    # A robot point starts at the centre of the room, detects particles
+    # flowing toward the exits, and moves to intercept that flow.
+    # Particles treat the robot as a dynamic obstacle — same quadratic-band
+    # repulsion as inter-particle repulsion, just anchored to robot_pos.
+    np.random.seed(42)
+    phase1_starts = np.column_stack([
+        np.random.uniform(1.0, 9.0, N),
+        np.random.uniform(3.0, 9.0, N),
+    ])
+
+    phase1_trajs, robot_traj, robot_targets = run_evacuation_with_robot_phase1(
+        phase1_starts, exits, evac_walls,
+        beta=4.0, alpha=0.04, n_steps=1000, tol=0.15,
+        R_p=0.6,   w_p=30.0,
+        robot_start=[5.0, 5.0],
+        robot_alpha=0.08,
+        detection_radius=2.0,
+        R_robot=0.9, w_robot=50.0,
+    )
+    plot_evacuation_with_robot(
+        phase1_trajs, robot_traj, robot_targets,
+        phase1_starts, exits, evac_walls
     )
