@@ -16,7 +16,8 @@ Four simulation modes are supported:
 | Evacuation (soft-min) | Two exits via soft-min | Yes, synchronous | No |
 | Phase 1 — robot interference | Two exits via soft-min | Yes, synchronous | Yes (centroid) |
 | Phase 2 — clustering targeting | Two exits via soft-min | Yes, synchronous | Yes (k-means) |
-| Phase 3 — prediction | Two exits via soft-min | Yes, synchronous | Yes (k-means + prediction) |
+| Phase 3 — prediction | Two exits via soft-min | Yes, synchronous | Yes (k-means + EMA + prediction) |
+| Phase 4 — IK arm | Two exits via soft-min | Yes, synchronous | Yes (2-link arm, Jacobian-transpose IK) |
 
 All gradients are derived analytically from first principles.
 
@@ -431,6 +432,83 @@ All other robot parameters are unchanged from Phase 1/2.
 | Orange diamonds | Predicted target (clamped) at sampled timesteps |
 | Faint orange arrows | Smoothed centroid → predicted target (prediction offset) |
 
+---
+
+## Phase 4 — 2-Link Planar Arm with Inverse Kinematics
+
+### Concept
+
+Phase 4 replaces the moving robot point with the **end-effector of a 2-link
+planar arm** rooted at a fixed base position. The targeting pipeline
+(clustering → EMA → prediction) is unchanged. The only difference:
+
+```
+Phase 3:  robot_pos += robot_alpha * (target - robot_pos)   (point moves directly)
+
+Phase 4:  angles = arm_ik_step(base, angles, lengths, target, alpha_ik)
+          ee_pos = arm_forward_kinematics(base, angles, lengths)[-1]
+```
+
+Particles repel from `ee_pos` using the same quadratic-band cost as before.
+
+### Forward kinematics
+
+```
+Convention: θ1 = absolute angle of link 1 from +x axis
+            θ2 = angle of link 2 relative to link 1
+
+joint0 = base
+joint1 = base + L1 · [cos(θ1), sin(θ1)]           (elbow)
+ee     = joint1 + L2 · [cos(θ1+θ2), sin(θ1+θ2)]   (end-effector)
+```
+
+### Jacobian (analytic)
+
+```
+∂ee_x/∂θ1 = -L1·sin(θ1) - L2·sin(θ1+θ2)
+∂ee_x/∂θ2 =             - L2·sin(θ1+θ2)
+∂ee_y/∂θ1 =  L1·cos(θ1) + L2·cos(θ1+θ2)
+∂ee_y/∂θ2 =               L2·cos(θ1+θ2)
+
+J = [[∂ee_x/∂θ1, ∂ee_x/∂θ2],
+     [∂ee_y/∂θ1, ∂ee_y/∂θ2]]   shape (2, 2)
+```
+
+### Jacobian-transpose IK
+
+```
+e     = target - ee                  (end-effector error)
+dθ    = alpha_ik · Jᵀ · e           (gradient of 0.5·||e||² w.r.t. θ)
+θ_new = θ + dθ
+```
+
+**Why Jacobian transpose instead of pseudo-inverse?**
+`Jᵀ` requires no matrix inversion and never blows up — it is a gradient step
+on the squared end-effector error and is always stable. Convergence is slower
+near singularities but fully adequate for tracking a slow-moving predicted
+target.
+
+### Arm parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `arm_base` | [5.0, 0.2] | Fixed root — bottom-centre of room |
+| `arm_lengths` | [3.0, 3.0] | Link lengths; total reach = 6.0 |
+| `arm_angles0` | [π/2, −π/6] | Initial joint angles |
+| `alpha_ik` | 0.05 | Jacobian-transpose IK step size |
+
+### Visualisation additions (Phase 4)
+
+| Element | What it shows |
+|---------|--------------|
+| Dark-red bold lines | Arm links at final configuration |
+| Dark-red faint lines | Arm links at sampled timesteps (history) |
+| Filled dark-red circles | Joint positions (final) |
+| Black square | Arm base (fixed) |
+| Solid magenta line | End-effector trajectory |
+| Magenta X | End-effector final position |
+| Faint magenta circle | Influence radius `R_robot` around final ee |
+
 ## Cost Field Visualisation
 
 ```python
@@ -473,10 +551,15 @@ main.py
   predict_cluster_target(smoothed, prev_smoothed, horizon)    — clamped linear extrapolation
   update_robot_target(positions, active, exits, radius, prev) — clustering + smoothing + prediction
   run_evacuation_with_robot_phase1(...)                       — Phase 1/2/3 simulation loop
+  arm_forward_kinematics(base, angles, lengths)               — 2-link planar FK (joint positions)
+  arm_jacobian(angles, lengths)                               — analytic 2×2 Jacobian (∂ee/∂θ)
+  arm_ik_step(base, angles, lengths, target, alpha_ik)        — Jacobian-transpose IK step
+  run_evacuation_with_robot_arm(...)                          — Phase 4 IK arm simulation loop
   plot_results(trajectory, ...)                               — single-particle plot
   plot_multi_particle_results(trajectories, ..., exits)       — all trajectories + exits
   plot_cost_field_and_vectors(x0, g, ...)                     — cost landscape + vectors
   plot_evacuation_with_robot(trajs, robot_traj, ...)          — Phase 3 visualisation
+  plot_evacuation_with_robot_arm(trajs, ee_traj, ...)         — Phase 4 IK arm visualisation
 ```
 
 ## Requirements
@@ -495,7 +578,7 @@ pip install numpy matplotlib
 python main.py
 ```
 
-Six windows open in sequence:
+Seven windows open in sequence:
 
 1. **Single-particle trajectory** — one particle from `(2,2)` routing around
    the n-shape to the single goal.
@@ -514,3 +597,9 @@ Six windows open in sequence:
    room), and moves to intercept. Robot trajectory: dashed magenta; influence
    circles: faint magenta; raw centroid trail: blue squares; smoothed centroid:
    cyan triangles; predicted target: orange diamonds with directional arrows.
+7. **Phase 4 — 2-link planar arm IK** — same scene again. A 2-link arm
+   (`L1=L2=3`) is rooted at `(5, 0.2)` (bottom wall, centre). Each step,
+   Jacobian-transpose IK moves the end-effector toward the predicted dominant
+   cluster. Particles repel from the end-effector exactly as before. Arm links
+   shown in dark red (faint history + bold final); end-effector trajectory in
+   solid magenta.

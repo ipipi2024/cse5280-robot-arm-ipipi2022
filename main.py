@@ -1235,7 +1235,376 @@ def plot_evacuation_with_robot(trajectories, robot_traj, robot_targets,
 
 
 # ─────────────────────────────────────────────
-# 18. Main
+# 18. 2-link planar arm — forward kinematics and IK
+# ─────────────────────────────────────────────
+
+def arm_forward_kinematics(base, angles, lengths):
+    """
+    Compute joint positions for a 2-link planar arm.
+
+    Convention
+    ----------
+    theta1 : absolute angle of link 1 from the +x axis (radians)
+    theta2 : angle of link 2 relative to link 1 (radians)
+
+    Joint positions
+    ---------------
+        joint0 = base                                (root, fixed)
+        joint1 = base + L1 * [cos(θ1), sin(θ1)]     (elbow)
+        ee     = joint1 + L2 * [cos(θ1+θ2), sin(θ1+θ2)]  (end-effector)
+
+    Parameters
+    ----------
+    base    : (2,) fixed root position
+    angles  : [theta1, theta2]
+    lengths : [L1, L2]
+
+    Returns
+    -------
+    joints : list of three (2,) arrays — [root, elbow, end_effector]
+    """
+    t1, t2 = angles
+    L1, L2 = lengths
+    elbow = np.array(base) + L1 * np.array([np.cos(t1), np.sin(t1)])
+    ee    = elbow           + L2 * np.array([np.cos(t1 + t2), np.sin(t1 + t2)])
+    return [np.array(base, dtype=float), elbow, ee]
+
+
+def arm_jacobian(angles, lengths):
+    """
+    Analytic 2×2 Jacobian of the end-effector w.r.t. joint angles [θ1, θ2].
+
+    Derivation
+    ----------
+        ee_x = L1·cos(θ1) + L2·cos(θ1+θ2)
+        ee_y = L1·sin(θ1) + L2·sin(θ1+θ2)
+
+        ∂ee_x/∂θ1 = -L1·sin(θ1) - L2·sin(θ1+θ2)
+        ∂ee_x/∂θ2 =             - L2·sin(θ1+θ2)
+        ∂ee_y/∂θ1 =  L1·cos(θ1) + L2·cos(θ1+θ2)
+        ∂ee_y/∂θ2 =               L2·cos(θ1+θ2)
+
+    Returns
+    -------
+    J : (2, 2) — columns correspond to θ1, θ2
+    """
+    t1, t2 = angles
+    L1, L2 = lengths
+    s1,  c1  = np.sin(t1),      np.cos(t1)
+    s12, c12 = np.sin(t1 + t2), np.cos(t1 + t2)
+    return np.array([
+        [-L1 * s1 - L2 * s12,  -L2 * s12],
+        [ L1 * c1 + L2 * c12,   L2 * c12],
+    ])
+
+
+def arm_ik_step(base, angles, lengths, target, alpha_ik=0.05):
+    """
+    One Jacobian-transpose IK step nudging the end-effector toward target.
+
+    Why Jacobian transpose?
+      J^T is O(1) to compute (no inversion), always numerically stable, and
+      sufficient for tracking a slow-moving target.  The update is a gradient
+      step on the squared end-effector error:
+
+          L(θ) = 0.5 · ||ee(θ) - target||²
+          ∂L/∂θ = J^T · (ee - target)   →   θ -= alpha_ik · J^T · (ee - target)
+                                         ↔   θ += alpha_ik · J^T · e
+
+    Parameters
+    ----------
+    base     : (2,) arm root (fixed)
+    angles   : [θ1, θ2] current joint angles
+    lengths  : [L1, L2]
+    target   : (2,) desired end-effector position
+    alpha_ik : gradient step size (tune alongside robot_alpha)
+
+    Returns
+    -------
+    new_angles : [θ1, θ2] updated joint angles (list, not numpy array,
+                 to match the mutable state carried through the loop)
+    """
+    joints = arm_forward_kinematics(base, angles, lengths)
+    ee     = joints[-1]
+    e      = target - ee                     # end-effector error vector
+    J      = arm_jacobian(angles, lengths)
+    dtheta = alpha_ik * (J.T @ e)            # Jacobian-transpose gradient step
+    return [angles[0] + dtheta[0], angles[1] + dtheta[1]]
+
+
+# ─────────────────────────────────────────────
+# 19. Evacuation simulation with IK arm (Phase 4)
+# ─────────────────────────────────────────────
+
+def run_evacuation_with_robot_arm(starts, exits, walls, beta=4.0,
+                                  alpha=0.04, n_steps=1000, tol=0.15,
+                                  R_p=0.6, w_p=30.0,
+                                  arm_base=None,
+                                  arm_angles=None,
+                                  arm_lengths=None,
+                                  alpha_ik=0.05,
+                                  detection_radius=2.0,
+                                  R_robot=0.9, w_robot=50.0,
+                                  horizon=3, lambda_smooth=0.3):
+    """
+    Evacuation simulation where the robot is a 2-link planar arm.
+
+    The targeting pipeline (clustering → EMA smoothing → prediction) is
+    identical to Phase 3.  The only difference:
+
+      Phase 3:  robot_pos += robot_alpha * (target - robot_pos)
+      Phase 4:  angles     = arm_ik_step(base, angles, lengths, target, alpha_ik)
+                ee_pos      = arm_forward_kinematics(base, angles, lengths)[-1]
+
+    Particles see the end-effector position `ee_pos` as the dynamic
+    obstacle — exactly the same quadratic-band repulsion cost as before.
+
+    Parameters
+    ----------
+    arm_base    : (2,) fixed root of the arm.  Default: [5.0, 0.2]
+    arm_angles  : [θ1, θ2] initial joint angles.  Default: [π/2, -π/6]
+    arm_lengths : [L1, L2] link lengths.  Default: [3.0, 3.0]
+    alpha_ik    : Jacobian-transpose IK step size
+    (all other parameters identical to run_evacuation_with_robot_phase1)
+
+    Returns
+    -------
+    trajectories          : list of N arrays (T_i, 2)
+    ee_traj               : (n_steps, 2) end-effector positions over time
+    arm_angles_log        : list of [θ1, θ2] at each step
+    robot_targets         : (n_steps, 2) predicted targets used each step
+    cluster_centroids_log : list of (k,2) or None
+    dominant_centroid_log : list of (2,) or None
+    smoothed_centroid_log : list of (2,) or None
+    predicted_target_log  : list of (2,) or None
+    """
+    exits     = np.array(exits)
+    N         = len(starts)
+    positions = np.array(starts, dtype=float)
+    active    = np.ones(N, dtype=bool)
+    trajs     = [[p.copy()] for p in positions]
+
+    # ── Arm state ──────────────────────────────────────────────────────────
+    base    = np.array(arm_base    if arm_base    is not None else [5.0, 0.2])
+    angles  = list(arm_angles      if arm_angles  is not None else [np.pi / 2, -np.pi / 6])
+    lengths = list(arm_lengths     if arm_lengths is not None else [3.0, 3.0])
+
+    ee_pos  = arm_forward_kinematics(base, angles, lengths)[-1]   # current ee
+
+    ee_traj           = [ee_pos.copy()]
+    arm_angles_log    = [list(angles)]
+    robot_targets_log = [ee_pos.copy()]   # before first IK step, use initial ee
+
+    cluster_centroids_log = [None]
+    dominant_centroid_log = [None]
+    smoothed_centroid_log = [None]
+    predicted_target_log  = [None]
+    prev_smoothed         = None
+
+    # Use the initial ee as the fallback "previous target"
+    prev_target = ee_pos.copy()
+
+    for _ in range(n_steps):
+        if not np.any(active):
+            break
+
+        # ── a. Cluster → smooth → predict target ──────────────────────────
+        target, centroids, dom_centroid, smoothed, predicted = \
+            update_robot_target(
+                positions, active, exits, detection_radius, prev_target,
+                prev_smoothed=prev_smoothed, horizon=horizon,
+                lambda_smooth=lambda_smooth
+            )
+        cluster_centroids_log.append(centroids)
+        dominant_centroid_log.append(dom_centroid)
+        smoothed_centroid_log.append(smoothed)
+        predicted_target_log.append(predicted)
+        if smoothed is not None:
+            prev_smoothed = smoothed
+        prev_target = target
+
+        # ── b. IK step: move arm end-effector toward predicted target ──────
+        angles = arm_ik_step(base, angles, lengths, target, alpha_ik)
+        ee_pos = arm_forward_kinematics(base, angles, lengths)[-1]
+
+        # ── c. Snapshot for synchronous gradient computation ───────────────
+        snapshot = positions.copy()
+
+        # ── d. Compute gradients — ee_pos replaces robot_pos as obstacle ──
+        grads = np.zeros_like(positions)
+        for i in range(N):
+            if active[i]:
+                xi = snapshot[i]
+                grads[i] = total_gradient_with_particles_softmin(
+                    i, snapshot, exits, walls, R_p, w_p, beta
+                )
+                # End-effector is the dynamic obstacle felt by particles
+                grads[i] += grad_robot_obstacle(xi, ee_pos, R_robot, w_robot)
+
+        # ── e. Update all particles simultaneously ─────────────────────────
+        for i in range(N):
+            if active[i]:
+                positions[i] -= alpha * grads[i]
+                trajs[i].append(positions[i].copy())
+                if np.min(np.linalg.norm(exits - positions[i], axis=1)) < tol:
+                    active[i] = False
+
+        ee_traj.append(ee_pos.copy())
+        arm_angles_log.append(list(angles))
+        robot_targets_log.append(target.copy())
+
+    return ([np.array(t) for t in trajs],
+            np.array(ee_traj),
+            arm_angles_log,
+            np.array(robot_targets_log),
+            cluster_centroids_log,
+            dominant_centroid_log,
+            smoothed_centroid_log,
+            predicted_target_log)
+
+
+# ─────────────────────────────────────────────
+# 20. IK arm visualisation (Phase 4)
+# ─────────────────────────────────────────────
+
+def plot_evacuation_with_robot_arm(trajectories, ee_traj, arm_angles_log,
+                                   robot_targets, starts, exits, walls,
+                                   arm_base, arm_lengths,
+                                   R_robot=0.9,
+                                   dominant_centroid_log=None,
+                                   smoothed_centroid_log=None,
+                                   predicted_target_log=None):
+    """
+    Plot the Phase 4 evacuation scene with a 2-link planar arm.
+
+    Shows all Phase 3 layers plus:
+      - end-effector trajectory (solid magenta line)
+      - arm links at sampled timesteps (faint grey)
+      - arm links at final configuration (bold dark red)
+      - joint positions (filled circles)
+      - influence-radius circle around final end-effector
+    """
+    from matplotlib.patches import Circle
+
+    N       = len(trajectories)
+    colours = plt.cm.hsv(np.linspace(0, 0.85, max(N, 1)))
+    base    = np.array(arm_base)
+
+    fig, ax = plt.subplots(figsize=(9, 9))
+
+    # ── Particle trajectories + start markers ─────────────────────────────
+    for i, traj in enumerate(trajectories):
+        c = colours[i % len(colours)]
+        ax.plot(traj[:, 0], traj[:, 1], color=c,
+                linewidth=0.9, alpha=0.7, zorder=2)
+        ax.scatter(*traj[0], color=c, edgecolors='black',
+                   s=45, zorder=5, linewidths=0.6)
+
+    # ── Arm snapshots at sampled timesteps (faint) ────────────────────────
+    samp = max(1, len(arm_angles_log) // 30)
+    for ang in arm_angles_log[::samp]:
+        joints = arm_forward_kinematics(base, ang, arm_lengths)
+        xs = [j[0] for j in joints]
+        ys = [j[1] for j in joints]
+        ax.plot(xs, ys, color='darkred', linewidth=1.0, alpha=0.15, zorder=3)
+
+    # ── Final arm configuration (bold) ────────────────────────────────────
+    final_joints = arm_forward_kinematics(base, arm_angles_log[-1], arm_lengths)
+    fxs = [j[0] for j in final_joints]
+    fys = [j[1] for j in final_joints]
+    ax.plot(fxs, fys, color='darkred', linewidth=3.0, alpha=0.9,
+            zorder=7, label='Arm (final)')
+    # Joint markers
+    ax.scatter(fxs[:-1], fys[:-1], color='darkred', s=60,
+               zorder=8, edgecolors='black', linewidths=0.8)
+    # Base marker
+    ax.scatter(*base, color='black', s=80, marker='s',
+               zorder=9, edgecolors='black', label='Arm base')
+
+    # ── End-effector trajectory ───────────────────────────────────────────
+    ax.plot(ee_traj[:, 0], ee_traj[:, 1],
+            color='magenta', linewidth=1.4, linestyle='-',
+            alpha=0.7, zorder=6, label='End-effector trajectory')
+    ax.scatter(*ee_traj[-1], color='magenta', marker='X',
+               s=160, zorder=9, edgecolors='black', linewidths=0.8,
+               label='End-effector (final)')
+
+    # ── Influence radius around final end-effector ────────────────────────
+    ax.add_patch(Circle(ee_traj[-1], R_robot,
+                        color='magenta', fill=False,
+                        linewidth=1.4, alpha=0.6, zorder=6))
+
+    # ── Predicted target trail ────────────────────────────────────────────
+    if predicted_target_log is not None:
+        preds = [p for p in predicted_target_log if p is not None]
+        if preds:
+            pa = np.array(preds)
+            ax.scatter(pa[:, 0], pa[:, 1],
+                       color='orangered', s=20, alpha=0.45,
+                       marker='D', zorder=4, linewidths=0,
+                       label='Predicted target')
+
+    # ── Smoothed centroid trail ───────────────────────────────────────────
+    if smoothed_centroid_log is not None:
+        smos = [s for s in smoothed_centroid_log if s is not None]
+        if smos:
+            sa = np.array(smos)
+            ax.scatter(sa[:, 0], sa[:, 1],
+                       color='cyan', s=16, alpha=0.45,
+                       marker='^', zorder=4, linewidths=0,
+                       label='Smoothed centroid (EMA)')
+
+    # ── Exits ─────────────────────────────────────────────────────────────
+    for k, ex in enumerate(exits):
+        ax.scatter(*ex, color='lime', s=200, zorder=8,
+                   marker='*', edgecolors='black', linewidths=0.8)
+        ax.annotate(f'Exit {k+1}', xy=ex,
+                    xytext=(ex[0] + 0.15, ex[1] + 0.15),
+                    fontsize=9, color='darkgreen', fontweight='bold')
+
+    # ── Walls ─────────────────────────────────────────────────────────────
+    for wall in walls:
+        ax.plot([wall['a'][0], wall['b'][0]],
+                [wall['a'][1], wall['b'][1]],
+                color='black', linewidth=3, zorder=4)
+
+    legend_handles = [
+        Line2D([0], [0], color='grey', linewidth=0.9,
+               label=f'Particle trajectories (N={N})'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
+               markeredgecolor='black', markersize=7, label='Starts'),
+        Line2D([0], [0], marker='*', color='w', markerfacecolor='lime',
+               markeredgecolor='black', markersize=13, label='Exits'),
+        Line2D([0], [0], color='darkred', linewidth=2.5, label='Arm (final)'),
+        Line2D([0], [0], color='darkred', linewidth=1.0, alpha=0.3,
+               label='Arm (history, sampled)'),
+        Line2D([0], [0], marker='s', color='w', markerfacecolor='black',
+               markersize=7, label='Arm base'),
+        Line2D([0], [0], color='magenta', linewidth=1.4,
+               label='End-effector trajectory'),
+        Line2D([0], [0], marker='X', color='w', markerfacecolor='magenta',
+               markeredgecolor='black', markersize=11, label='End-effector (final)'),
+        Line2D([0], [0], color='magenta', linewidth=1.2, alpha=0.6,
+               label=f'Influence radius (R={R_robot})'),
+        Line2D([0], [0], marker='^', color='w', markerfacecolor='cyan',
+               markersize=6, alpha=0.6, label='Smoothed centroid (EMA)'),
+        Line2D([0], [0], marker='D', color='w', markerfacecolor='orangered',
+               markersize=6, alpha=0.7, label='Predicted target'),
+        Line2D([0], [0], color='black', linewidth=3, label='Wall'),
+    ]
+    ax.legend(handles=legend_handles, loc='upper right', fontsize=8)
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.set_aspect('equal')
+    ax.set_title(f"Phase 4 — 2-link planar arm IK  (N={N})\n"
+                 "End-effector tracks predicted dominant cluster (Jacobian-transpose IK)")
+    ax.grid(True, linestyle='--', alpha=0.4)
+    plt.tight_layout()
+    plt.show()
+
+
+# ─────────────────────────────────────────────
+# 21. Main
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1388,4 +1757,46 @@ if __name__ == "__main__":
         dominant_centroid_log=dominant_log,
         smoothed_centroid_log=smoothed_log,
         predicted_target_log=predicted_log,
+    )
+
+    # ── Phase 4: evacuation with 2-link planar arm IK ─────────────────────
+    # Same crowd scene as Phase 3. The robot point is replaced by the
+    # end-effector of a 2-link arm rooted at (5, 0.2) — just above the
+    # bottom wall, centred horizontally. The arm uses Jacobian-transpose IK
+    # to track the predicted dominant cluster target each timestep.
+    # Particles repel from the end-effector position exactly as before.
+    np.random.seed(42)
+    arm_starts = np.column_stack([
+        np.random.uniform(1.0, 9.0, N),
+        np.random.uniform(3.0, 9.0, N),
+    ])
+
+    arm_base    = [5.0, 0.2]          # fixed root just above bottom wall
+    arm_lengths = [3.0, 3.0]          # total reach = 6.0 — covers both exits
+    arm_angles0 = [np.pi / 2, -np.pi / 6]   # initial: roughly pointing up
+
+    (arm_trajs, ee_traj, arm_angles_log,
+     arm_robot_targets, arm_cluster_log,
+     arm_dominant_log, arm_smoothed_log, arm_predicted_log) = \
+        run_evacuation_with_robot_arm(
+            arm_starts, exits, evac_walls,
+            beta=4.0, alpha=0.04, n_steps=1000, tol=0.15,
+            R_p=0.6, w_p=30.0,
+            arm_base=arm_base,
+            arm_angles=arm_angles0,
+            arm_lengths=arm_lengths,
+            alpha_ik=0.05,
+            detection_radius=2.0,
+            R_robot=0.9, w_robot=50.0,
+            horizon=3, lambda_smooth=0.3,
+        )
+    plot_evacuation_with_robot_arm(
+        arm_trajs, ee_traj, arm_angles_log,
+        arm_robot_targets, arm_starts, exits, evac_walls,
+        arm_base=arm_base,
+        arm_lengths=arm_lengths,
+        R_robot=0.9,
+        dominant_centroid_log=arm_dominant_log,
+        smoothed_centroid_log=arm_smoothed_log,
+        predicted_target_log=arm_predicted_log,
     )
