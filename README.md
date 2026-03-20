@@ -603,3 +603,39 @@ Seven windows open in sequence:
    cluster. Particles repel from the end-effector exactly as before. Arm links
    shown in dark red (faint history + bold final); end-effector trajectory in
    solid magenta.
+8. **Baseline animation** — same scene as window 5, animated over time using
+   `animate_evacuation()`. No robot; serves as the reference for comparison.
+9. **Phase 4 animation** — same IK arm run, animated with arm links, moving
+   end-effector, and predicted target marker.
+
+## Experiments
+
+See **[experiments.ipynb](experiments.ipynb)** for a fully reproducible
+experiment report that runs directly in Jupyter.
+
+### What the notebook does
+
+| Section | Content |
+|---------|---------|
+| 1. Setup | Imports all project modules; defines the shared scene (exits, walls, 25 particles with fixed seed) |
+| 2. Baseline | Runs `run_evacuation_simulation` (no robot); shows animated result via `animate_evacuation` |
+| 3. IK arm | Runs `run_evacuation_with_robot_arm`; shows animated result with arm links and predicted target |
+| 4. Comparison | Plots **evacuation curves** — particles remaining vs. timestep — for both conditions; discusses observations |
+
+### Key finding
+
+The robot arm measurably delays evacuation: the evacuation curve for the IK arm
+condition falls more slowly than the baseline. Particles near exits are deflected
+by the end-effector, forced onto longer detour paths, and temporarily concentrated
+near the second exit. The robot does not stop evacuation entirely — particles
+eventually find a clear path — but continuous cluster-tracking maintains
+persistent interference throughout the run.
+
+### Running the notebook
+
+```bash
+pip install jupyter
+jupyter notebook experiments.ipynb
+```
+
+Run all cells top-to-bottom (`Kernel → Restart & Run All`).
