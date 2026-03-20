@@ -141,6 +141,18 @@ if __name__ == "__main__":
         repulsion=True, exits=exits
     )
 
+    # ── Animation: baseline evacuation (no robot) ─────────────────────────────
+    # Uses evac_trajectories computed above (seed 42, same starts as robot runs).
+    # ee_traj / arm_angles_log / predicted_target_log all None → no robot layer.
+    anim_baseline = animate_evacuation(
+        evac_trajectories, exits, evac_walls,
+        ee_traj=None,
+        arm_angles_log=None,
+        predicted_target_log=None,
+        interval=30,
+        title="Baseline — evacuation without robot (animated)",
+    )
+
     # ── Phase 1: evacuation with robot interference ───────────────────────────
     # Same scene as the soft-min evacuation above (open room, two exits).
     # A robot point starts at the centre of the room, detects particles
