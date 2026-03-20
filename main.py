@@ -29,7 +29,90 @@ def grad_goal(x, g):
 
 
 # ─────────────────────────────────────────────
-# 2. Point-to-segment: distance + closest point
+# 2. Soft-min goal cost + gradient (two exits)
+# ─────────────────────────────────────────────
+#
+# Why soft-min instead of hard min?
+# ──────────────────────────────────
+# hard min:  C = min(C1, C2)
+#   - non-differentiable at the switching surface where C1 == C2
+#   - gradient jumps discontinuously → particle snaps between exits, causing
+#     oscillation or getting stuck at the indifference boundary
+#
+# soft-min:  C = -(1/beta) * log( exp(-beta*C1) + exp(-beta*C2) )
+#   - fully smooth and differentiable everywhere
+#   - gradient is a weighted average of the two exit gradients
+#   - weights are proportional to exp(-beta*Ci): the cheaper exit gets more pull
+#   - as beta → ∞ it approaches the hard min; beta=4 gives a smooth but
+#     sharp-enough preference that nearby particles clearly favour the closer exit
+
+def softmin_goal_cost(x, exits, beta):
+    """
+    Soft-min over quadratic costs to each exit.
+
+        C_i   = 0.5 * ||x - g_i||²
+        C_soft = -(1/beta) * log( sum_i exp(-beta * C_i) )
+
+    Uses the log-sum-exp trick for numerical stability:
+        shift the exponents by max(-beta*C_i) before summing so no value
+        overflows, then correct the log afterwards.
+
+    Parameters
+    ----------
+    x     : current position (2,)
+    exits : (K, 2) array of exit positions
+    beta  : sharpness parameter (higher = closer to hard min)
+    """
+    costs  = np.array([0.5 * np.dot(x - g, x - g) for g in exits])
+    logits = -beta * costs
+    shift  = np.max(logits)                        # numerical stability
+    log_sum = shift + np.log(np.sum(np.exp(logits - shift)))
+    return -(1.0 / beta) * log_sum
+
+
+def grad_softmin_goal(x, exits, beta):
+    """
+    Analytic gradient of the soft-min goal cost.
+
+    Derivation:
+        Let C_i = 0.5 ||x - g_i||²,   grad C_i = x - g_i
+
+        Differentiating C_soft w.r.t. x:
+
+            d/dx [-(1/beta) log Z]  where  Z = sum_i exp(-beta * C_i)
+
+            = -(1/beta) * (1/Z) * sum_i [ -beta * grad_C_i * exp(-beta * C_i) ]
+
+            = sum_i  [ exp(-beta * C_i) / Z ]  *  grad_C_i
+
+            = sum_i  w_i * (x - g_i)
+
+        where w_i = softmax(-beta * C_i) are the exit weights.
+        w_i is large when C_i is small (x is close to exit i).
+
+    This is a weighted average of the individual goal gradients — no
+    discontinuity at the indifference surface between exits.
+
+    Parameters
+    ----------
+    x     : current position (2,)
+    exits : (K, 2) array of exit positions
+    beta  : sharpness parameter
+    """
+    costs  = np.array([0.5 * np.dot(x - g, x - g) for g in exits])
+    logits = -beta * costs
+    shift  = np.max(logits)
+    exp_vals = np.exp(logits - shift)
+    weights  = exp_vals / np.sum(exp_vals)         # softmax = exit weights
+
+    grad = np.zeros_like(x)
+    for w, g in zip(weights, exits):
+        grad = grad + w * (x - g)
+    return grad
+
+
+# ─────────────────────────────────────────────
+# 3. Point-to-segment: distance + closest point
 # ─────────────────────────────────────────────
 
 def point_to_segment(x, a, b):
@@ -117,8 +200,39 @@ def total_gradient(x, g, walls):
     return grad
 
 
+def total_gradient_softmin(x, exits, walls, beta):
+    """
+    Total gradient using the soft-min goal term (multi-exit, no repulsion).
+
+        grad C = grad_softmin_goal(x, exits, beta)
+               + sum over walls: grad_wall_penalty(x, ...)
+    """
+    grad = grad_softmin_goal(x, exits, beta)
+    for wall in walls:
+        grad = grad + grad_wall_penalty(x, wall['a'], wall['b'],
+                                        wall['R'], wall['w'])
+    return grad
+
+
+def total_gradient_with_particles_softmin(i, positions, exits, walls,
+                                          R_p, w_p, beta):
+    """
+    Full gradient for particle i using soft-min goal + repulsion.
+
+        grad C_i = grad_softmin_goal(x_i, exits, beta)
+                 + sum over walls:    grad_wall_penalty(x_i, ...)
+                 + sum over j ≠ i:   grad_particle_repulsion(x_i, x_j, R_p, w_p)
+    """
+    xi   = positions[i]
+    grad = total_gradient_softmin(xi, exits, walls, beta)
+    for j, xj in enumerate(positions):
+        if j != i:
+            grad = grad + grad_particle_repulsion(xi, xj, R_p, w_p)
+    return grad
+
+
 # ─────────────────────────────────────────────
-# 5. Simulation loop
+# 6. Simulation loop
 # ─────────────────────────────────────────────
 
 def run_simulation(x0, g, walls, alpha=0.001, n_steps=500):
@@ -327,7 +441,74 @@ def run_multi_particle_simulation_with_repulsion(starts, g, walls,
 
 
 # ─────────────────────────────────────────────
-# 9. Plotting
+# 9. Evacuation simulation (soft-min + repulsion)
+# ─────────────────────────────────────────────
+
+def run_evacuation_simulation(starts, exits, walls, beta=4.0,
+                              alpha=0.04, n_steps=1000, tol=0.05,
+                              R_p=0.6, w_p=30.0):
+    """
+    Multi-particle gradient descent toward the soft-min of two (or more) exits,
+    with pairwise repulsion and synchronous updates.
+
+    Each particle is attracted to the cheaper exit — not by a hard if/else
+    switch, but because the soft-min gradient smoothly weights the pull from
+    each exit by exp(-beta * C_i). Nearby particles naturally spread across
+    exits, preventing crowding, since repulsion pushes them apart while the
+    goal pull steers them toward whichever exit is least costly from their
+    current position.
+
+    A particle is considered to have reached an exit when it is within `tol`
+    of ANY exit.
+
+    Parameters
+    ----------
+    starts : (N, 2) array — start positions
+    exits  : (K, 2) array — exit positions
+    walls  : list of wall dicts
+    beta   : soft-min sharpness (higher = sharper exit preference)
+    alpha  : step size
+    n_steps: maximum steps
+    tol    : convergence threshold (distance to nearest exit)
+    R_p    : particle repulsion radius
+    w_p    : particle repulsion weight
+
+    Returns
+    -------
+    trajectories : list of N arrays, each (T_i, 2)
+    """
+    exits     = np.array(exits)
+    N         = len(starts)
+    positions = np.array(starts, dtype=float)
+    active    = np.ones(N, dtype=bool)
+    trajs     = [[p.copy()] for p in positions]
+
+    for _ in range(n_steps):
+        if not np.any(active):
+            break
+
+        snapshot = positions.copy()
+
+        grads = np.zeros_like(positions)
+        for i in range(N):
+            if active[i]:
+                grads[i] = total_gradient_with_particles_softmin(
+                    i, snapshot, exits, walls, R_p, w_p, beta
+                )
+
+        for i in range(N):
+            if active[i]:
+                positions[i] = positions[i] - alpha * grads[i]
+                trajs[i].append(positions[i].copy())
+                # Stop when particle reaches any exit
+                if np.min(np.linalg.norm(exits - positions[i], axis=1)) < tol:
+                    active[i] = False
+
+    return [np.array(t) for t in trajs]
+
+
+# ─────────────────────────────────────────────
+# 10. Plotting
 # ─────────────────────────────────────────────
 
 def plot_results(trajectory, x0, g, walls):
@@ -366,7 +547,8 @@ def plot_results(trajectory, x0, g, walls):
 # 10. Multi-particle plot
 # ─────────────────────────────────────────────
 
-def plot_multi_particle_results(trajectories, starts, g, walls, repulsion=False):
+def plot_multi_particle_results(trajectories, starts, g, walls,
+                                repulsion=False, exits=None):
     """
     Plot all particle trajectories together on one axes.
 
@@ -374,8 +556,10 @@ def plot_multi_particle_results(trajectories, starts, g, walls, repulsion=False)
     ----------
     trajectories : list of (T_i, 2) arrays returned by run_multi_particle_simulation
     starts       : (N, 2) array or list used as start positions
-    g            : goal position
+    g            : single goal position (pass None when using exits)
     walls        : list of wall dicts
+    repulsion    : bool — controls subtitle text
+    exits        : optional (K, 2) array — if provided, drawn instead of g
     """
     N = len(trajectories)
     # Use a continuous colormap so N=25 particles all get distinct colours
@@ -391,8 +575,29 @@ def plot_multi_particle_results(trajectories, starts, g, walls, repulsion=False)
         ax.scatter(*traj[0], color=colour, edgecolors='black',
                    s=50, zorder=5, linewidths=0.6)
 
-    # Goal
-    ax.scatter(*g, color='red', s=140, zorder=6, marker='*')
+    # Goal(s)
+    legend_handles = [
+        Line2D([0], [0], color='grey', linewidth=0.9,
+               label=f'Trajectories (N={N})'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
+               markeredgecolor='black', markersize=7, label='Start positions'),
+        Line2D([0], [0], color='black', linewidth=3, label='Wall'),
+    ]
+    if exits is not None:
+        for k, ex in enumerate(exits):
+            ax.scatter(*ex, color='lime', s=200, zorder=6,
+                       marker='*', edgecolors='black', linewidths=0.8)
+            ax.annotate(f'Exit {k+1}', xy=ex,
+                        xytext=(ex[0] + 0.15, ex[1] + 0.15),
+                        fontsize=9, color='darkgreen', fontweight='bold')
+        legend_handles.append(
+            Line2D([0], [0], marker='*', color='w', markerfacecolor='lime',
+                   markeredgecolor='black', markersize=14, label='Exits'))
+    elif g is not None:
+        ax.scatter(*g, color='red', s=140, zorder=6, marker='*')
+        legend_handles.append(
+            Line2D([0], [0], marker='*', color='w', markerfacecolor='red',
+                   markersize=14, label='Goal'))
 
     # Walls
     for wall in walls:
@@ -400,15 +605,6 @@ def plot_multi_particle_results(trajectories, starts, g, walls, repulsion=False)
                 [wall['a'][1], wall['b'][1]],
                 color='black', linewidth=3, zorder=4)
 
-    legend_handles = [
-        Line2D([0], [0], color='grey', linewidth=0.9,
-               label=f'Trajectories (N={N})'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
-               markeredgecolor='black', markersize=7, label='Start positions'),
-        Line2D([0], [0], marker='*', color='w', markerfacecolor='red',
-               markersize=14, label='Goal'),
-        Line2D([0], [0], color='black', linewidth=3, label='Wall'),
-    ]
     ax.legend(handles=legend_handles, loc='upper left')
     ax.set_xlim(0, 10)
     ax.set_ylim(0, 10)
@@ -421,7 +617,7 @@ def plot_multi_particle_results(trajectories, starts, g, walls, repulsion=False)
 
 
 # ─────────────────────────────────────────────
-# 11. Cost field + gradient vector visualisation
+# 13. Cost field + gradient vector visualisation
 # ─────────────────────────────────────────────
 
 def plot_cost_field_and_vectors(x0, g, walls, trajectory=None, grid_n=60):
@@ -510,7 +706,7 @@ def plot_cost_field_and_vectors(x0, g, walls, trajectory=None, grid_n=60):
 
 
 # ─────────────────────────────────────────────
-# 12. Main
+# 14. Main
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -596,3 +792,37 @@ if __name__ == "__main__":
         R_p=0.6, w_p=30.0
     )
     plot_multi_particle_results(trajectories_repel, starts, g, walls, repulsion=True)
+
+    # ── Evacuation scenario: soft-min goal toward two exits ───────────────────
+    #
+    # Particles start randomly across the room.
+    # Two exits are placed at the bottom — left and right of centre.
+    # No hard assignment: each particle's pull toward each exit is weighted
+    # by exp(-beta * C_i), so nearby particles naturally prefer the closer exit.
+    # Repulsion spreads particles across both exits to avoid crowding.
+    #
+    beta = 4.0     # sharpness: higher → stronger preference for the closer exit
+
+    exits = np.array([
+        [2.0, 1.2],   # left exit
+        [8.0, 1.2],   # right exit
+    ])
+
+    # For this scenario use the same boundary walls but drop the n-shape:
+    evac_walls = boundary_walls
+
+    np.random.seed(42)
+    evac_starts = np.column_stack([
+        np.random.uniform(1.0, 9.0, N),
+        np.random.uniform(3.0, 9.0, N),
+    ])
+
+    evac_trajectories = run_evacuation_simulation(
+        evac_starts, exits, evac_walls, beta=beta,
+        alpha=0.04, n_steps=1000, tol=0.15,
+        R_p=0.6, w_p=30.0
+    )
+    plot_multi_particle_results(
+        evac_trajectories, evac_starts, g=None, walls=evac_walls,
+        repulsion=True, exits=exits
+    )

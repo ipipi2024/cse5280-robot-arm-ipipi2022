@@ -2,83 +2,80 @@
 
 ## Overview
 
-A 2D multi-particle simulation where particles navigate from start positions to
-a shared goal while avoiding wall obstacles inside a bounded room. Motion
+A 2D multi-particle simulation where particles navigate from start positions
+toward goal(s) while avoiding wall obstacles inside a bounded room. Motion
 emerges purely from **cost minimisation** via gradient descent — there is no
-collision detection, no path-finding (no A*), and no hard "if hit wall then
-stop" logic.
+collision detection, no path-finding (no A*), and no hard routing logic.
 
-The environment consists of:
-- An **outer square boundary** `[0,10] × [0,10]` made of 4 wall segments
-- An **n-shaped interior enclosure** made of 3 wall segments (two vertical
-  legs + one top bar), open at the bottom
+Three simulation modes are supported:
 
-The goal is placed **inside** the n-shaped enclosure. Particles start from
-various positions **outside** the enclosure. The direct path to the goal is
-blocked by the enclosure walls, so each particle must detour around the outside
-and enter through the open bottom gap — behaviour that emerges entirely from
-the cost landscape.
-
-Two simulation modes are supported:
-- **Independent** — each particle only feels goal attraction and wall repulsion
-- **With pairwise repulsion** — particles additionally repel each other using
-  the same quadratic-band penalty framework, updated synchronously each step
+| Mode | Goal term | Repulsion |
+|------|-----------|-----------|
+| Independent | Single goal | No |
+| Pairwise repulsion | Single goal | Yes, synchronous |
+| Evacuation (soft-min) | Two exits via soft-min | Yes, synchronous |
 
 All gradients are derived analytically from first principles.
 
 ## Cost Function
 
-The total cost for particle `i` is:
-
-```
-C_i(x) = C_goal(x_i, g)
-        + sum over walls:       C_wall(x_i, wall)
-        + sum over j ≠ i:       C_repel(x_i, x_j)     ← only with repulsion enabled
-```
-
-### Goal term
+### Single-goal term
 
 ```
 C_goal(x) = 0.5 * ||x - g||²
-
 grad C_goal = x - g
 ```
+
+### Soft-min goal term (two exits)
+
+Each particle is smoothly attracted toward the cheaper of two (or more) exits.
+
+```
+C_i   = 0.5 * ||x - g_i||²        (per-exit quadratic cost)
+
+C_soft(x) = -(1/beta) * log( sum_i exp(-beta * C_i) )
+```
+
+**Why soft-min instead of hard min?**
+
+`hard min = min(C1, C2)` is non-differentiable where `C1 == C2` — the gradient
+jumps discontinuously at the indifference surface, causing oscillation or
+particles getting stuck. Soft-min is smooth everywhere and its gradient is a
+**weighted average** of the per-exit gradients:
+
+```
+w_i      = exp(-beta * C_i) / sum_j exp(-beta * C_j)   (softmax weights)
+
+grad C_soft = sum_i  w_i * (x - g_i)
+```
+
+`w_i` is large when `C_i` is small — the closer exit gets more pull. As
+`beta → ∞` the result approaches the hard min. `beta = 4.0` gives a sharp but
+smooth preference. The log-sum-exp trick is used internally for numerical
+stability.
 
 ### Wall penalty term (per wall segment)
 
 ```
-C_wall(x) = 0.5 * w * (R - d(x))²   if d(x) < R
-           = 0                         otherwise
+C_wall(x) = 0.5 * w * (R - d(x))²   if d(x) < R,   else 0
 
-grad C_wall = -w * (R - d) * (x - p) / max(d, eps)   if d < R
-            = 0                                         otherwise
+grad C_wall = -w * (R - d) * (x - p) / max(d, eps)   if d < R,   else 0
 ```
 
-where `p` is the closest point on the segment to `x`.
+`p` = closest point on the segment, `d` = distance to segment.
 
 ### Particle-particle repulsion term
 
 Same quadratic-band form as the wall penalty, applied to pairwise distances.
 
 ```
-C_repel(xi, xj) = 0.5 * w_p * (R_p - d_ij)²   if d_ij < R_p
-                = 0                               otherwise
+C_repel(xi, xj) = 0.5 * w_p * (R_p - d_ij)²   if d_ij < R_p,   else 0
 
-where d_ij = ||xi - xj||
+grad_xi C_repel = -w_p * (R_p - d_ij) * (xi - xj) / max(d_ij, eps)
 ```
 
-**Analytic gradient w.r.t. xi (chain rule — identical derivation to wall gradient):**
-
-```
-dC/d(d_ij)  = -w_p * (R_p - d_ij)          (outer derivative)
-d(d_ij)/dxi = (xi - xj) / d_ij             (gradient of Euclidean distance)
-
-grad_xi C_repel = -w_p * (R_p - d_ij) * (xi - xj) / max(d_ij, eps)   if d_ij < R_p
-                = 0                                                       otherwise
-```
-
-The direction pushes `xi` away from `xj`. By symmetry, the gradient w.r.t.
-`xj` is the negative — equal and opposite repulsion.
+Pushes `xi` away from `xj`. By symmetry the gradient w.r.t. `xj` is the
+negative — equal and opposite repulsion.
 
 ## Distance: Point to Segment
 
@@ -99,33 +96,35 @@ x = x - alpha * grad C(x)
 
 ### Multiple particles — independent
 
-Each particle runs its own loop with no awareness of others:
-
 ```
-for each x0 in starts:
+for each x0:
     for each step:
         if ||x - g|| < tol: break
         x = x - alpha * total_gradient(x, g, walls)
 ```
 
-### Multiple particles — with pairwise repulsion (synchronous)
+### Multiple particles — synchronous (repulsion or evacuation)
 
 ```
-for each step:
-    snapshot = positions.copy()                    # 1. freeze current state
-    for each particle i:
-        grads[i] = total_gradient_with_particles(  # 2. compute from snapshot
-                       i, snapshot, g, walls, R_p, w_p)
-    for each particle i:
-        positions[i] -= alpha * grads[i]           # 3. apply all at once
+snapshot = positions.copy()                      # 1. freeze current state
+grads[i] = total_gradient_with_particles*(...)   # 2. all from snapshot
+positions[i] -= alpha * grads[i]                 # 3. all updates together
 ```
 
-**Why synchronous?** All gradients are computed from the same position snapshot
-before any particle moves. If particle 1 moved first, particle 2 would react to
-a position that didn't exist at the start of the step, breaking the physical
-symmetry of the pairwise repulsion.
+**Why synchronous?** All gradients read the same position snapshot before any
+particle moves, preserving the physical symmetry of pairwise repulsion.
 
-## Environment Layout
+### Evacuation convergence criterion
+
+A particle stops when it reaches **any** exit:
+
+```
+if min_k ||x - exit_k|| < tol: stop
+```
+
+## Environment Layouts
+
+### n-shape scenario (single goal)
 
 ```
 (0,10)──────────────────────────────(10,10)
@@ -133,17 +132,35 @@ symmetry of the pairwise repulsion.
   │    (3.5,8.5)──────────(7.5,8.5)     │
   │        │   goal(5.5,7.0)  │         │
   │        │                  │         │
-  │        │                  │         │
   │    (3.5,3.0)          (7.5,3.0)     │
   │             ↑ open gap              │
-  │   starts scattered outside          │
+  │   N=25 starts scattered outside     │
 (0,0)──────────────────────────────(10,0)
 ```
 
+Particles must detour around the n-shape legs and enter through the bottom gap.
+
+### Evacuation scenario (soft-min, two exits)
+
+```
+(0,10)──────────────────────────────(10,10)
+  │   N=25 starts   y∈[3,9]            │
+  │   x∈[1,9]  scattered               │
+  │                                     │
+  │                                     │
+  │                                     │
+  │                                     │
+  │  ★ Exit 1              Exit 2 ★    │
+(0,0)──────────────────────────────(10,0)
+      (2,1.2)              (8,1.2)
+```
+
+No interior walls. Particles near the left naturally prefer Exit 1; particles
+near the right prefer Exit 2. Repulsion spreads load across both exits.
+
 ## Particle Start Positions
 
-`N = 25` particles are sampled randomly across three regions outside the
-n-shape enclosure (`np.random.seed(42)` for reproducibility):
+### n-shape runs (`np.random.seed(42)`, N=25)
 
 | Region | x range | y range | Count |
 |--------|---------|---------|-------|
@@ -151,25 +168,28 @@ n-shape enclosure (`np.random.seed(42)` for reproducibility):
 | Right  | [7, 9]     | [2, 8]   | N // 3 |
 | Bottom | [3.5, 7.5] | [1, 2.5] | remainder |
 
-Left and right particles must detour around the corresponding n-shape leg.
-Bottom particles are roughly aligned with the gap and enter more directly.
+### Evacuation run (`np.random.seed(42)`, N=25)
 
-## Wall & Repulsion Parameters
+Uniform random in `x∈[1,9], y∈[3,9]`.
+
+## Parameters
 
 | Parameter    | Value | Description |
 |--------------|-------|-------------|
 | `boundary_R` | 1.0   | Influence radius for outer boundary walls |
 | `boundary_w` | 80.0  | Penalty weight for outer boundary walls |
 | `interior_R` | 1.0   | Influence radius for n-shape walls |
-| `interior_w` | 120.0 | Penalty weight for n-shape walls (stronger to force detour) |
-| `R_p`        | 0.6   | Particle influence radius — smaller bubble lets 25 particles pass through the gap |
-| `w_p`        | 30.0  | Particle repulsion weight — softer so particles can still converge near the goal |
-| `alpha`      | 0.04  | Slightly reduced from 0.05 for stability with 25 interacting particles |
-| `n_steps`    | 1000  | Increased to give all particles time to converge |
+| `interior_w` | 120.0 | Penalty weight for n-shape walls |
+| `R_p`        | 0.6   | Particle repulsion radius |
+| `w_p`        | 30.0  | Particle repulsion weight |
+| `alpha`      | 0.04  | Gradient descent step size |
+| `n_steps`    | 1000  | Maximum steps per particle |
+| `tol`        | 0.05 / 0.15 | Convergence threshold (single goal / evacuation) |
+| `beta`       | 4.0   | Soft-min sharpness — higher → sharper exit preference |
 
-**Tuning `R_p` and `w_p`:** too large `R_p` spreads particles so far apart they
-may not all fit through the gap; too large `w_p` prevents particles converging
-near the goal. Reduce `w_p` if particles are pushed away before reaching `tol`.
+**Tuning `beta`:** low values (≈1) give a very smooth blend between exits;
+high values (≈10+) approach a hard switch and may introduce gradient instability
+near the indifference surface.
 
 ## Cost Field Visualisation
 
@@ -179,30 +199,35 @@ plot_cost_field_and_vectors(x0, g, walls, trajectory=None, grid_n=60)
 
 | Layer | What it shows |
 |-------|--------------|
-| `contourf` (plasma) | Total cost — bright = high (near walls, far from goal), dark = low (near goal). |
-| `quiver` (white arrows) | `−∇C(x)` — the direction gradient descent moves the particle. |
-| Cyan line | Actual trajectory overlaid (when `trajectory` is passed). |
+| `contourf` (plasma) | Total cost — bright = high, dark = low (near goal). |
+| `quiver` (white) | `−∇C(x)` — descent direction at each grid point. |
+| Cyan line | Trajectory overlaid (when passed). |
 
 ## Project Structure
 
 ```
 main.py
-  goal_cost(x, g)                                    — goal cost
-  grad_goal(x, g)                                    — analytic gradient of goal cost
-  point_to_segment(x, a, b)                          — distance + closest point on segment
-  wall_cost(x, a, b, R, w)                           — wall penalty value
-  grad_wall_penalty(x, a, b, R, w)                   — analytic gradient of wall penalty
-  total_cost(x, g, walls)                            — goal + wall costs
-  total_gradient(x, g, walls)                        — goal + wall gradients
-  particle_repulsion_cost(xi, xj, R_p, w_p)          — pairwise repulsion cost
-  grad_particle_repulsion(xi, xj, R_p, w_p)          — analytic gradient of repulsion
-  total_gradient_with_particles(i, positions, ...)   — goal + wall + repulsion gradient
-  run_simulation(x0, g, walls, ...)                  — single-particle loop
-  run_multi_particle_simulation(...)                 — N independent loops
-  run_multi_particle_simulation_with_repulsion(...)  — N synchronous loops with repulsion
-  plot_results(trajectory, ...)                      — single-particle plot
-  plot_multi_particle_results(trajectories, ...)     — all trajectories on one plot
-  plot_cost_field_and_vectors(x0, g, ...)            — cost landscape + vector field
+  goal_cost(x, g)                                        — single-goal cost
+  grad_goal(x, g)                                        — single-goal gradient
+  softmin_goal_cost(x, exits, beta)                      — soft-min over K exits
+  grad_softmin_goal(x, exits, beta)                      — weighted-average gradient
+  point_to_segment(x, a, b)                              — distance + closest point
+  wall_cost(x, a, b, R, w)                               — wall penalty value
+  grad_wall_penalty(x, a, b, R, w)                       — analytic wall gradient
+  total_cost(x, g, walls)                                — single-goal + walls
+  total_gradient(x, g, walls)                            — single-goal + wall gradients
+  total_gradient_softmin(x, exits, walls, beta)          — soft-min + wall gradients
+  particle_repulsion_cost(xi, xj, R_p, w_p)             — pairwise repulsion cost
+  grad_particle_repulsion(xi, xj, R_p, w_p)             — repulsion gradient
+  total_gradient_with_particles(i, positions, ...)       — single-goal + walls + repulsion
+  total_gradient_with_particles_softmin(i, pos, ...)     — soft-min + walls + repulsion
+  run_simulation(x0, g, walls, ...)                      — single-particle loop
+  run_multi_particle_simulation(...)                     — N independent loops
+  run_multi_particle_simulation_with_repulsion(...)      — N synchronous loops
+  run_evacuation_simulation(starts, exits, walls, ...)   — soft-min evacuation loop
+  plot_results(trajectory, ...)                          — single-particle plot
+  plot_multi_particle_results(trajectories, ..., exits)  — all trajectories + exits
+  plot_cost_field_and_vectors(x0, g, ...)                — cost landscape + vectors
 ```
 
 ## Requirements
@@ -221,13 +246,15 @@ pip install numpy matplotlib
 python main.py
 ```
 
-Four windows open in sequence:
+Five windows open in sequence:
 
 1. **Single-particle trajectory** — one particle from `(2,2)` routing around
-   the n-shape to the goal at `(5.5, 7.0)`.
-2. **Cost field plot** — plasma cost landscape with descent arrows and the
-   single-particle trajectory in cyan.
-3. **Multi-particle (independent)** — all 5 particles, no inter-particle forces.
-4. **Multi-particle (with repulsion)** — all 5 particles with pairwise
-   quadratic-band repulsion, synchronous updates. Trajectories spread apart
-   as particles push each other away while converging to the goal.
+   the n-shape to the single goal.
+2. **Cost field** — plasma cost landscape with descent arrows and trajectory.
+3. **Multi-particle independent** — 25 particles, no inter-particle forces,
+   single goal inside the n-shape.
+4. **Multi-particle with repulsion** — 25 particles with pairwise repulsion,
+   synchronous updates, single goal.
+5. **Evacuation (soft-min)** — 25 particles in an open room with two exits.
+   Each particle smoothly steers toward the cheaper exit; repulsion spreads
+   load across both exits without any explicit assignment logic.
