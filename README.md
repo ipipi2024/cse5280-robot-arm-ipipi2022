@@ -523,43 +523,56 @@ plot_cost_field_and_vectors(x0, g, walls, trajectory=None, grid_n=60)
 
 ## Project Structure
 
+| File | Responsibility |
+|------|---------------|
+| `config.py` | Shared numerical constants (`EPS`) |
+| `crowd.py` | All crowd physics: goal costs, wall penalties, particle repulsion, simulation loops |
+| `robot.py` | Robot obstacle cost/gradient, near-exit detection, k-means clustering, EMA smoothing, prediction, Phase 3 loop |
+| `ik_arm.py` | Forward kinematics, analytic Jacobian, Jacobian-transpose IK step, Phase 4 loop |
+| `visualization.py` | All plotting functions + `animate_evacuation` |
+| `experiments.py` | Placeholder for additional experiment helpers |
+| `main.py` | Entry point — imports all modules, defines scenes, runs all demos |
+| `experiments.ipynb` | Jupyter experiment report: baseline vs IK arm comparison with animations and evacuation curves |
+
+### Key functions by module
+
+**`crowd.py`**
 ```
-main.py
-  goal_cost(x, g)                                        — single-goal cost
-  grad_goal(x, g)                                        — single-goal gradient
-  softmin_goal_cost(x, exits, beta)                      — soft-min over K exits
-  grad_softmin_goal(x, exits, beta)                      — weighted-average gradient
-  point_to_segment(x, a, b)                              — distance + closest point
-  wall_cost(x, a, b, R, w)                               — wall penalty value
-  grad_wall_penalty(x, a, b, R, w)                       — analytic wall gradient
-  total_cost(x, g, walls)                                — single-goal + walls
-  total_gradient(x, g, walls)                            — single-goal + wall gradients
-  total_gradient_softmin(x, exits, walls, beta)          — soft-min + wall gradients
-  particle_repulsion_cost(xi, xj, R_p, w_p)             — pairwise repulsion cost
-  grad_particle_repulsion(xi, xj, R_p, w_p)             — repulsion gradient
-  total_gradient_with_particles(i, positions, ...)       — single-goal + walls + repulsion
-  total_gradient_with_particles_softmin(i, pos, ...)     — soft-min + walls + repulsion
-  run_simulation(x0, g, walls, ...)                      — single-particle loop
-  run_multi_particle_simulation(...)                     — N independent loops
-  run_multi_particle_simulation_with_repulsion(...)      — N synchronous loops
-  run_evacuation_simulation(starts, exits, walls, ...)        — soft-min evacuation loop
-  robot_obstacle_cost(x, robot_pos, R_robot, w_robot)         — robot point obstacle cost
-  grad_robot_obstacle(x, robot_pos, R_robot, w_robot)         — analytic robot gradient
-  find_particles_near_exits(positions, active, exits, radius) — detect near-exit flow
-  kmeans(points, k, n_iter)                                   — Lloyd's k-means clustering
-  smooth_centroid(current, prev_smoothed, lambda_smooth)      — EMA over dominant centroid
-  predict_cluster_target(smoothed, prev_smoothed, horizon)    — clamped linear extrapolation
-  update_robot_target(positions, active, exits, radius, prev) — clustering + smoothing + prediction
-  run_evacuation_with_robot_phase1(...)                       — Phase 1/2/3 simulation loop
-  arm_forward_kinematics(base, angles, lengths)               — 2-link planar FK (joint positions)
-  arm_jacobian(angles, lengths)                               — analytic 2×2 Jacobian (∂ee/∂θ)
-  arm_ik_step(base, angles, lengths, target, alpha_ik)        — Jacobian-transpose IK step
-  run_evacuation_with_robot_arm(...)                          — Phase 4 IK arm simulation loop
-  plot_results(trajectory, ...)                               — single-particle plot
-  plot_multi_particle_results(trajectories, ..., exits)       — all trajectories + exits
-  plot_cost_field_and_vectors(x0, g, ...)                     — cost landscape + vectors
-  plot_evacuation_with_robot(trajs, robot_traj, ...)          — Phase 3 visualisation
-  plot_evacuation_with_robot_arm(trajs, ee_traj, ...)         — Phase 4 IK arm visualisation
+goal_cost / grad_goal                          — single-goal quadratic cost + gradient
+softmin_goal_cost / grad_softmin_goal          — soft-min over K exits
+point_to_segment                               — distance + closest point on segment
+wall_cost / grad_wall_penalty                  — quadratic-band wall repulsion
+particle_repulsion_cost / grad_particle_repulsion — pairwise inter-particle repulsion
+total_gradient_with_particles_softmin(...)     — combined gradient (used in all sim loops)
+run_evacuation_simulation(...)                 — soft-min evacuation, no robot
+```
+
+**`robot.py`**
+```
+grad_robot_obstacle(x, robot_pos, R, w)        — analytic gradient of robot obstacle cost
+find_particles_near_exits(...)                 — detect particles approaching exits
+kmeans(points, k, n_iter)                      — Lloyd's algorithm, fixed seed
+smooth_centroid(current, prev, lambda)         — EMA over dominant centroid
+predict_cluster_target(smoothed, prev, H)      — clamped linear extrapolation
+update_robot_target(...)                       — full pipeline: cluster → smooth → predict
+run_evacuation_with_robot_phase1(...)          — Phase 3 point-robot simulation loop
+```
+
+**`ik_arm.py`**
+```
+arm_forward_kinematics(base, angles, lengths)  — joint positions [root, elbow, ee]
+arm_jacobian(angles, lengths)                  — analytic 2×2 Jacobian ∂ee/∂θ
+arm_ik_step(base, angles, lengths, target)     — Jacobian-transpose IK update
+run_evacuation_with_robot_arm(...)             — Phase 4 IK arm simulation loop
+```
+
+**`visualization.py`**
+```
+plot_results / plot_multi_particle_results     — single/multi-particle static plots
+plot_cost_field_and_vectors                    — cost landscape + descent arrows
+plot_evacuation_with_robot                     — Phase 3 static plot
+plot_evacuation_with_robot_arm                 — Phase 4 static plot
+animate_evacuation(...)                        — FuncAnimation over pre-computed data
 ```
 
 ## Requirements
@@ -578,7 +591,7 @@ pip install numpy matplotlib
 python main.py
 ```
 
-Seven windows open in sequence:
+Nine windows open in sequence:
 
 1. **Single-particle trajectory** — one particle from `(2,2)` routing around
    the n-shape to the single goal.
