@@ -610,6 +610,8 @@ Seven windows open in sequence:
 
 ## Experiments
 
+**Video demonstration:** https://youtu.be/29cgG1ZzXi0
+
 See **[experiments.ipynb](experiments.ipynb)** for a fully reproducible
 experiment report that runs directly in Jupyter.
 
