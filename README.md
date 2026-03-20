@@ -332,13 +332,14 @@ only the targeting logic changes.
 
 ---
 
-## Phase 3 — Prediction of Cluster Motion
+## Phase 3 — Prediction of Cluster Motion (with EMA smoothing)
 
 ### Concept
 
-Phase 3 extends Phase 2 by estimating where the dominant cluster will be
-**H steps in the future** and sending the robot there instead of the current
-centroid.
+Phase 3 extends Phase 2 by:
+1. **Smoothing** the dominant centroid with an exponential moving average (EMA)
+2. **Predicting** its future position via linear extrapolation of the smoothed velocity
+3. **Clamping** the predicted target to the room bounds `[0, 10] × [0, 10]`
 
 **Why prediction helps:**
 
@@ -348,64 +349,76 @@ may arrive after the cluster has already passed through the exit. Predicting H
 steps ahead gives the robot a **lead** — it intercepts the flow before it
 reaches the exit rather than chasing it from behind.
 
+**Why smooth before predicting:**
+
+The raw dominant centroid jumps frame-to-frame because k-means occasionally
+re-assigns particles or swaps which cluster is "dominant". Applying an EMA with
+`lambda_smooth=0.3` damps these discontinuities so the velocity estimate used
+for prediction is a stable trend rather than amplified noise.
+
 **How `horizon` affects behaviour:**
 
 | horizon | Effect |
 |---------|--------|
 | 0 | Equivalent to Phase 2 reactive targeting |
-| 3–8 | Sweet spot — meaningful lead without overshooting |
-| >10 | Predicted target may jump past the exit or leave the room |
+| 3–5 | Sweet spot — meaningful lead without overshooting |
+| >8 | Risk of overshooting past exit even with clamping |
 
-### Prediction formula
+### Smoothing + prediction pipeline
 
 ```
-v         = current_dominant_centroid - previous_dominant_centroid   (velocity estimate)
+# Step 1 — smooth raw centroid with EMA
+smoothed = (1 - lambda_smooth) * prev_smoothed + lambda_smooth * raw_centroid
 
-predicted = current_dominant_centroid + horizon * v
+# Step 2 — estimate velocity from smoothed values
+v = smoothed - prev_smoothed
+
+# Step 3 — linear extrapolation, clamped to room
+predicted = clamp(smoothed + horizon * v,  lo=0, hi=10)
 ```
 
-One-step finite difference gives a linear extrapolation. No smoothing or
-filtering is applied — the motion of the dominant centroid is already smooth
-because it is the mean of many particles.
-
-### predict_cluster_target helper
+### Helper functions
 
 ```python
-predicted = predict_cluster_target(current_centroid, prev_centroid, horizon)
+smoothed  = smooth_centroid(current, prev_smoothed, lambda_smooth)
+predicted = predict_cluster_target(smoothed_centroid, prev_smoothed, horizon)
 ```
 
-Falls back to `current_centroid` when `prev_centroid is None` (first step) or
-`horizon == 0`.
+`predict_cluster_target` falls back to `smoothed_centroid` when
+`prev_smoothed is None` (first step) or `horizon == 0`.
 
 ### update_robot_target (Phase 3)
 
-Now returns 4 values:
+Now returns 5 values:
 
 ```
-target            — predicted dominant centroid (robot moves here)
+target            — predicted (and clamped) robot target
 centroids         — (k, 2) all k-means centroids, or None
-dominant_centroid — (2,) current dominant centroid before prediction, or None
+dom_centroid      — (2,) raw dominant centroid, or None
+smoothed          — (2,) EMA-smoothed dominant centroid, or None
 predicted_target  — (2,) same as target when clustering fires, else None
 ```
 
 ### Per-step order (Phase 3)
 
 ```
-1. cluster near-exit particles  →  dominant centroid (current)
-2. predict dominant centroid    →  predicted target  (current + H * v)
-3. move robot toward predicted target (proportional)
-4. snapshot particle positions
-5. compute all gradients:
+1. cluster near-exit particles  →  raw dominant centroid
+2. EMA-smooth dominant centroid →  smoothed centroid
+3. predict smoothed centroid    →  predicted target (clamped)
+4. move robot toward predicted target (proportional)
+5. snapshot particle positions
+6. compute all gradients:
        soft-min goal + walls + inter-particle repulsion + robot repulsion
-6. apply all particle updates simultaneously
-7. save current dominant centroid as prev_dominant for next step
+7. apply all particle updates simultaneously
+8. advance EMA state: prev_smoothed ← smoothed
 ```
 
 ### Phase 3 parameters
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `horizon` | 5 | Prediction look-ahead in steps (0 = reactive) |
+| `horizon` | 3 | Prediction look-ahead in steps (0 = reactive) |
+| `lambda_smooth` | 0.3 | EMA blend weight (smaller → more smoothing) |
 
 All other robot parameters are unchanged from Phase 1/2.
 
@@ -413,9 +426,10 @@ All other robot parameters are unchanged from Phase 1/2.
 
 | Element | What it shows |
 |---------|--------------|
-| Blue squares | Dominant cluster centroid at sampled timesteps |
-| Orange diamonds | Predicted target at sampled timesteps |
-| Faint orange arrows | Direction and magnitude of prediction offset |
+| Blue squares | Raw dominant centroid at sampled timesteps |
+| Cyan triangles | EMA-smoothed centroid at sampled timesteps |
+| Orange diamonds | Predicted target (clamped) at sampled timesteps |
+| Faint orange arrows | Smoothed centroid → predicted target (prediction offset) |
 
 ## Cost Field Visualisation
 
@@ -455,8 +469,9 @@ main.py
   grad_robot_obstacle(x, robot_pos, R_robot, w_robot)         — analytic robot gradient
   find_particles_near_exits(positions, active, exits, radius) — detect near-exit flow
   kmeans(points, k, n_iter)                                   — Lloyd's k-means clustering
-  predict_cluster_target(current, prev, horizon)              — linear extrapolation of cluster motion
-  update_robot_target(positions, active, exits, radius, prev) — clustering + prediction targeting
+  smooth_centroid(current, prev_smoothed, lambda_smooth)      — EMA over dominant centroid
+  predict_cluster_target(smoothed, prev_smoothed, horizon)    — clamped linear extrapolation
+  update_robot_target(positions, active, exits, radius, prev) — clustering + smoothing + prediction
   run_evacuation_with_robot_phase1(...)                       — Phase 1/2/3 simulation loop
   plot_results(trajectory, ...)                               — single-particle plot
   plot_multi_particle_results(trajectories, ..., exits)       — all trajectories + exits
@@ -492,10 +507,10 @@ Six windows open in sequence:
 5. **Evacuation (soft-min)** — 25 particles in an open room with two exits.
    Each particle smoothly steers toward the cheaper exit; repulsion spreads
    load across both exits without any explicit assignment logic.
-6. **Phase 3 — robot with clustering + prediction** — same open room and
-   exits. A robot point starts at `(5,5)`, clusters near-exit particles with
-   k-means (k=2), predicts the dominant cluster's position 5 steps ahead, and
-   moves to intercept that predicted position. Robot trajectory shown as dashed
-   magenta; influence-radius circles as faint magenta rings; dominant centroid
-   trail as blue squares; predicted target trail as orange diamonds with
-   directional arrows.
+6. **Phase 3 — robot with clustering + EMA smoothing + prediction** — same
+   open room and exits. A robot point starts at `(5,5)`, clusters near-exit
+   particles (k-means, k=2), smooths the dominant centroid with EMA
+   (`lambda=0.3`), predicts its position `horizon=3` steps ahead (clamped to
+   room), and moves to intercept. Robot trajectory: dashed magenta; influence
+   circles: faint magenta; raw centroid trail: blue squares; smoothed centroid:
+   cyan triangles; predicted target: orange diamonds with directional arrows.

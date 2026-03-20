@@ -820,63 +820,80 @@ def kmeans(points, k, n_iter=10):
     return centroids, labels
 
 
-def predict_cluster_target(current_centroid, prev_centroid, horizon):
+def smooth_centroid(current, prev_smoothed, lambda_smooth):
     """
-    Predict where the dominant cluster will be after `horizon` steps.
+    Exponential moving average (EMA) over the dominant cluster centroid.
 
-    Why prediction helps over purely reactive targeting?
-      A reactive robot always chases where the cluster *was*.  Because
-      particles move continuously toward exits, a reactive robot lags behind
-      and may arrive after the cluster has already reached the exit.
-      Predicting ahead by H steps gives the robot a lead — it intercepts
-      the flow before it reaches the exit rather than after.
+    smoothed = (1 - lambda_) * prev_smoothed + lambda_ * current
 
-    How horizon affects behaviour:
-      - horizon = 0  →  current centroid (equivalent to Phase 2 reactive)
-      - horizon = 3-8 →  typical sweet spot: enough lead without overshooting
-      - horizon >> 10 →  predicted target may leave the room boundary or jump
-                         past the exit; use conservatively.
+    Why smooth before predicting?
+      The raw dominant centroid jumps each step because k-means re-assigns
+      particles and occasionally swaps which cluster is "dominant".  Taking
+      an EMA with a small lambda_ (e.g. 0.3) damps these frame-to-frame
+      discontinuities so the velocity estimate used for prediction is a
+      stable trend rather than noise.
 
     Parameters
     ----------
-    current_centroid : (2,) dominant cluster centre this step
-    prev_centroid    : (2,) dominant cluster centre previous step, or None
-    horizon          : int — number of steps to look ahead
+    current       : (2,) raw dominant centroid this step
+    prev_smoothed : (2,) EMA value from the previous step, or None
+    lambda_smooth : float in (0, 1] — blend weight for the new observation.
+                    Smaller → more smoothing, larger lag.
+                    Larger → tracks faster, less smoothing.
 
     Returns
     -------
-    predicted : (2,) estimated future cluster position
+    smoothed : (2,) updated EMA value
     """
-    if prev_centroid is None or horizon == 0:
-        return current_centroid               # no history → stay reactive
+    if prev_smoothed is None:
+        return current.copy()               # cold start — initialise to first observation
+    return (1.0 - lambda_smooth) * prev_smoothed + lambda_smooth * current
 
-    velocity  = current_centroid - prev_centroid   # one-step displacement
-    return current_centroid + horizon * velocity
+
+def predict_cluster_target(smoothed_centroid, prev_smoothed, horizon, room_bounds=(0, 10)):
+    """
+    Predict where the dominant cluster will be after `horizon` steps,
+    using the smoothed centroid for velocity estimation. Clamps the result
+    to room bounds to prevent the robot from targeting outside the room.
+
+    velocity  = smoothed_centroid - prev_smoothed
+    predicted = smoothed_centroid + horizon * velocity
+    predicted = clamp(predicted, room_bounds)
+
+    Parameters
+    ----------
+    smoothed_centroid : (2,) EMA-smoothed dominant centroid this step
+    prev_smoothed     : (2,) EMA-smoothed dominant centroid previous step, or None
+    horizon           : int — steps to look ahead (0 → return smoothed_centroid)
+    room_bounds       : (lo, hi) scalar bounds applied to both x and y
+
+    Returns
+    -------
+    predicted : (2,) clamped predicted position
+    """
+    if prev_smoothed is None or horizon == 0:
+        return smoothed_centroid.copy()     # no history or no look-ahead
+
+    velocity  = smoothed_centroid - prev_smoothed   # one-step displacement (smoothed)
+    raw       = smoothed_centroid + horizon * velocity
+    lo, hi    = room_bounds
+    return np.clip(raw, lo, hi)             # stay inside [0, 10] × [0, 10]
 
 
 def update_robot_target(positions, active, exits, detection_radius, prev_target,
-                        k=2, prev_dominant=None, horizon=5):
+                        k=2, prev_smoothed=None, horizon=3, lambda_smooth=0.3):
     """
-    Compute the robot's new target using clustering + prediction (Phase 3).
+    Compute the robot's new target using clustering + EMA smoothing + prediction.
 
-    Why clustering instead of a global centroid?
-      With two exits the global mean drifts to the midpoint *between* the two
-      exit flows and never truly intercepts either one.  K-means separates
-      the flows into per-exit groups; targeting the *dominant* (largest)
-      cluster sends the robot into the densest stream of approaching particles.
-
-    Why prediction (Phase 3 addition)?
-      Purely reactive targeting chases where the cluster *was*.  Predicting
-      H steps ahead lets the robot intercept the flow before it reaches the
-      exit.  See predict_cluster_target() for details.
-
-    Strategy
-    --------
+    Pipeline per step
+    -----------------
     1. Find particles near any exit.
-    2. If none detected: hold previous target (no-op).
-    3. If fewer than k particles: fall back to their mean (no prediction).
-    4. Otherwise: run k-means(k), pick the dominant cluster, predict its
-       future position, and use that as the robot target.
+    2. If none detected: hold previous target.
+    3. If fewer than k particles: fall back to mean (no smoothing/prediction).
+    4. Run k-means(k), pick dominant cluster → raw centroid.
+    5. Smooth raw centroid with EMA (lambda_smooth).
+    6. Predict smoothed centroid H steps ahead; clamp to room.
+    7. Use predicted position as robot target.
 
     Parameters
     ----------
@@ -885,33 +902,36 @@ def update_robot_target(positions, active, exits, detection_radius, prev_target,
     exits            : (K, 2) exit positions
     detection_radius : float
     prev_target      : (2,) last known target (fallback)
-    k                : number of clusters (default 2 — one per exit)
-    prev_dominant    : (2,) dominant centroid from the previous step, or None
-    horizon          : int — prediction horizon in steps
+    k                : number of clusters
+    prev_smoothed    : (2,) EMA value from the previous step, or None
+    horizon          : int — prediction look-ahead steps
+    lambda_smooth    : float — EMA blend weight (0 < lambda_ <= 1)
 
     Returns
     -------
-    target           : (2,) new robot target (predicted dominant centroid)
-    centroids        : (k, 2) all cluster centroids, or None if skipped
-    dominant_centroid: (2,) current dominant centroid (before prediction), or None
-    predicted_target : (2,) the predicted target used (equals target when active)
+    target            : (2,) robot target (predicted, clamped)
+    centroids         : (k, 2) all k-means centroids, or None if skipped
+    dom_centroid      : (2,) raw dominant centroid, or None
+    smoothed          : (2,) EMA-smoothed dominant centroid, or None
+    predicted_target  : (2,) predicted target (same as target when active)
     """
     near = find_particles_near_exits(positions, active, exits, detection_radius)
     if len(near) == 0:
-        return prev_target, None, None, None   # no flow — hold
+        return prev_target, None, None, None, None   # no flow — hold
 
     pts = positions[near]
     if len(pts) < k:
         mean_pos = pts.mean(axis=0)
-        return mean_pos, None, mean_pos, mean_pos   # too few — use mean, no prediction
+        return mean_pos, None, mean_pos, mean_pos, mean_pos  # too few — plain mean
 
     centroids, labels = kmeans(pts, k=k)
-    sizes            = np.bincount(labels, minlength=k)
-    dominant         = np.argmax(sizes)              # cluster with the most particles
-    dom_centroid     = centroids[dominant]
+    sizes         = np.bincount(labels, minlength=k)
+    dominant      = np.argmax(sizes)
+    dom_centroid  = centroids[dominant]
 
-    predicted = predict_cluster_target(dom_centroid, prev_dominant, horizon)
-    return predicted, centroids, dom_centroid, predicted
+    smoothed  = smooth_centroid(dom_centroid, prev_smoothed, lambda_smooth)
+    predicted = predict_cluster_target(smoothed, prev_smoothed, horizon)
+    return predicted, centroids, dom_centroid, smoothed, predicted
 
 
 # ─────────────────────────────────────────────
@@ -925,21 +945,22 @@ def run_evacuation_with_robot_phase1(starts, exits, walls, beta=4.0,
                                      robot_alpha=0.08,
                                      detection_radius=2.0,
                                      R_robot=0.9, w_robot=50.0,
-                                     horizon=5):
+                                     horizon=3, lambda_smooth=0.3):
     """
     Evacuation simulation with Phase 3 robot interference agent
-    (clustering + prediction).
+    (clustering + EMA smoothing + clamped prediction).
 
     Each timestep:
-      a. cluster near-exit particles → find dominant cluster
-      b. predict dominant cluster's future position (horizon steps ahead)
-      c. move robot toward predicted position proportionally
-      d. compute all particle gradients from snapshot (synchronous):
+      a. cluster near-exit particles → raw dominant centroid
+      b. smooth centroid with EMA (lambda_smooth)
+      c. predict smoothed centroid H steps ahead; clamp to room
+      d. move robot toward predicted position proportionally
+      e. compute all particle gradients from snapshot (synchronous):
            soft-min exit attraction
          + wall repulsion
          + inter-particle repulsion
          + robot obstacle repulsion
-      e. update all particle positions
+      f. update all particle positions
 
     Parameters
     ----------
@@ -949,15 +970,17 @@ def run_evacuation_with_robot_phase1(starts, exits, walls, beta=4.0,
     R_robot          : robot obstacle influence radius
     w_robot          : robot obstacle penalty weight
     horizon          : int — prediction look-ahead steps (0 = reactive only)
+    lambda_smooth    : float — EMA blend weight for centroid smoothing (0 < λ ≤ 1)
 
     Returns
     -------
     trajectories          : list of N arrays (T_i, 2) — particle paths
     robot_traj            : (n_steps, 2) array — robot positions
     robot_targets         : (n_steps, 2) array — robot targets (predicted)
-    cluster_centroids_log : list of (k,2) arrays or None — all centroids per step
-    dominant_centroid_log : list of (2,) arrays or None — dominant centroid per step
-    predicted_target_log  : list of (2,) arrays or None — predicted targets per step
+    cluster_centroids_log : list of (k,2) or None — all k-means centroids per step
+    dominant_centroid_log : list of (2,) or None — raw dominant centroid per step
+    smoothed_centroid_log : list of (2,) or None — EMA-smoothed centroid per step
+    predicted_target_log  : list of (2,) or None — predicted targets per step
     """
     exits     = np.array(exits)
     N         = len(starts)
@@ -973,23 +996,27 @@ def run_evacuation_with_robot_phase1(starts, exits, walls, beta=4.0,
     robot_targets_log     = [robot_target.copy()]
     cluster_centroids_log = [None]
     dominant_centroid_log = [None]
+    smoothed_centroid_log = [None]
     predicted_target_log  = [None]
-    prev_dominant         = None   # dominant centroid from the previous step
+    prev_smoothed         = None   # EMA state — updated each step clustering fires
 
     for _ in range(n_steps):
         if not np.any(active):
             break
 
-        # ── a. Cluster near-exit particles; predict dominant cluster position ─
-        robot_target, centroids, dom_centroid, predicted = update_robot_target(
-            positions, active, exits, detection_radius, robot_target,
-            prev_dominant=prev_dominant, horizon=horizon
-        )
+        # ── a. Cluster → smooth → predict ─────────────────────────────────
+        robot_target, centroids, dom_centroid, smoothed, predicted = \
+            update_robot_target(
+                positions, active, exits, detection_radius, robot_target,
+                prev_smoothed=prev_smoothed, horizon=horizon,
+                lambda_smooth=lambda_smooth
+            )
         cluster_centroids_log.append(centroids)
         dominant_centroid_log.append(dom_centroid)
+        smoothed_centroid_log.append(smoothed)
         predicted_target_log.append(predicted)
-        if dom_centroid is not None:
-            prev_dominant = dom_centroid          # advance history for next step
+        if smoothed is not None:
+            prev_smoothed = smoothed              # advance EMA state for next step
 
         # ── b. Move robot toward target (proportional control) ────────────
         robot_pos = robot_pos + robot_alpha * (robot_target - robot_pos)
@@ -1027,6 +1054,7 @@ def run_evacuation_with_robot_phase1(starts, exits, walls, beta=4.0,
             np.array(robot_targets_log),
             cluster_centroids_log,
             dominant_centroid_log,
+            smoothed_centroid_log,
             predicted_target_log)
 
 
@@ -1038,6 +1066,7 @@ def plot_evacuation_with_robot(trajectories, robot_traj, robot_targets,
                                starts, exits, walls, R_robot=0.9,
                                cluster_centroids_log=None,
                                dominant_centroid_log=None,
+                               smoothed_centroid_log=None,
                                predicted_target_log=None):
     """
     Plot the Phase 3 evacuation scene:
@@ -1049,9 +1078,10 @@ def plot_evacuation_with_robot(trajectories, robot_traj, robot_targets,
       - robot final position (magenta X)
       - robot target trail (small grey dots)
       - cluster centroids trail (black circles, optional)
-      - dominant centroid trail (blue squares, optional)
+      - raw dominant centroid trail (blue squares, optional)
+      - smoothed centroid trail (cyan triangles, optional)
       - predicted target trail (orange diamonds, optional)
-      - faint line from dominant → predicted at each sampled step (optional)
+      - faint arrow from smoothed → predicted at each sampled step (optional)
       - walls (black)
     """
     N       = len(trajectories)
@@ -1102,28 +1132,57 @@ def plot_evacuation_with_robot(trajectories, robot_traj, robot_targets,
                            color='black', s=18, alpha=0.35,
                            marker='o', zorder=4, linewidths=0)
 
-    # Dominant centroid trail + predicted target trail + connector lines
-    if dominant_centroid_log is not None and predicted_target_log is not None:
-        dom_pts  = [(d, p) for d, p in zip(dominant_centroid_log, predicted_target_log)
-                    if d is not None and p is not None]
-        if dom_pts:
-            samp = max(1, len(dom_pts) // 40)
-            for dom, pred in dom_pts[::samp]:
-                # faint arrow from current dominant centroid to predicted target
-                ax.annotate('', xy=pred, xytext=dom,
-                            arrowprops=dict(arrowstyle='->', color='orangered',
-                                            lw=0.8, alpha=0.35),
-                            zorder=4)
-            dom_arr  = np.array([d for d, _ in dom_pts])
-            pred_arr = np.array([p for _, p in dom_pts])
-            ax.scatter(dom_arr[:, 0], dom_arr[:, 1],
-                       color='royalblue', s=20, alpha=0.45,
-                       marker='s', zorder=5, linewidths=0,
-                       label='Dominant centroid')
-            ax.scatter(pred_arr[:, 0], pred_arr[:, 1],
-                       color='orangered', s=28, alpha=0.55,
-                       marker='D', zorder=5, linewidths=0,
-                       label='Predicted target')
+    # Raw dominant, smoothed, predicted centroid trails + connector arrows
+    # Arrows go from smoothed centroid → predicted target to show the prediction
+    # offset produced by EMA velocity extrapolation.
+    have_dom  = dominant_centroid_log is not None
+    have_smo  = smoothed_centroid_log is not None
+    have_pred = predicted_target_log is not None
+
+    if have_dom or have_smo or have_pred:
+        # Collect steps where at least dominant fired
+        steps = [i for i, d in enumerate(dominant_centroid_log or [])
+                 if d is not None]
+        if steps:
+            samp = max(1, len(steps) // 40)
+
+            if have_dom:
+                dom_arr = np.array([dominant_centroid_log[i] for i in steps])
+                ax.scatter(dom_arr[:, 0], dom_arr[:, 1],
+                           color='royalblue', s=20, alpha=0.40,
+                           marker='s', zorder=5, linewidths=0,
+                           label='Raw dominant centroid')
+
+            if have_smo:
+                smo_valid = [smoothed_centroid_log[i] for i in steps
+                             if smoothed_centroid_log[i] is not None]
+                if smo_valid:
+                    smo_arr = np.array(smo_valid)
+                    ax.scatter(smo_arr[:, 0], smo_arr[:, 1],
+                               color='cyan', s=20, alpha=0.50,
+                               marker='^', zorder=5, linewidths=0,
+                               label='Smoothed centroid (EMA)')
+
+            if have_smo and have_pred:
+                for i in steps[::samp]:
+                    smo  = smoothed_centroid_log[i]
+                    pred = predicted_target_log[i]
+                    if smo is not None and pred is not None:
+                        # faint arrow: smoothed → predicted (shows prediction offset)
+                        ax.annotate('', xy=pred, xytext=smo,
+                                    arrowprops=dict(arrowstyle='->', color='orangered',
+                                                    lw=0.8, alpha=0.35),
+                                    zorder=4)
+
+            if have_pred:
+                pred_valid = [predicted_target_log[i] for i in steps
+                              if predicted_target_log[i] is not None]
+                if pred_valid:
+                    pred_arr = np.array(pred_valid)
+                    ax.scatter(pred_arr[:, 0], pred_arr[:, 1],
+                               color='orangered', s=28, alpha=0.55,
+                               marker='D', zorder=5, linewidths=0,
+                               label='Predicted target')
 
     # Exits
     for k, ex in enumerate(exits):
@@ -1157,7 +1216,9 @@ def plot_evacuation_with_robot(trajectories, robot_traj, robot_targets,
         Line2D([0], [0], marker='o', color='w', markerfacecolor='black',
                markersize=5, alpha=0.5, label='Cluster centroids'),
         Line2D([0], [0], marker='s', color='w', markerfacecolor='royalblue',
-               markersize=6, alpha=0.6, label='Dominant centroid'),
+               markersize=6, alpha=0.6, label='Raw dominant centroid'),
+        Line2D([0], [0], marker='^', color='w', markerfacecolor='cyan',
+               markersize=6, alpha=0.6, label='Smoothed centroid (EMA)'),
         Line2D([0], [0], marker='D', color='w', markerfacecolor='orangered',
                markersize=6, alpha=0.7, label='Predicted target'),
         Line2D([0], [0], color='black', linewidth=3, label='Wall'),
@@ -1308,7 +1369,7 @@ if __name__ == "__main__":
     ])
 
     (phase1_trajs, robot_traj, robot_targets,
-     cluster_log, dominant_log, predicted_log) = \
+     cluster_log, dominant_log, smoothed_log, predicted_log) = \
         run_evacuation_with_robot_phase1(
             phase1_starts, exits, evac_walls,
             beta=4.0, alpha=0.04, n_steps=1000, tol=0.15,
@@ -1317,7 +1378,7 @@ if __name__ == "__main__":
             robot_alpha=0.08,
             detection_radius=2.0,
             R_robot=0.9, w_robot=50.0,
-            horizon=5,
+            horizon=3, lambda_smooth=0.3,
         )
     plot_evacuation_with_robot(
         phase1_trajs, robot_traj, robot_targets,
@@ -1325,5 +1386,6 @@ if __name__ == "__main__":
         R_robot=0.9,
         cluster_centroids_log=cluster_log,
         dominant_centroid_log=dominant_log,
+        smoothed_centroid_log=smoothed_log,
         predicted_target_log=predicted_log,
     )
