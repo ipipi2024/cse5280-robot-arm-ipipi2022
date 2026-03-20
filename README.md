@@ -14,7 +14,8 @@ Four simulation modes are supported:
 | Independent | Single goal | No | No |
 | Pairwise repulsion | Single goal | Yes, synchronous | No |
 | Evacuation (soft-min) | Two exits via soft-min | Yes, synchronous | No |
-| Phase 1 — robot interference | Two exits via soft-min | Yes, synchronous | Yes |
+| Phase 1 — robot interference | Two exits via soft-min | Yes, synchronous | Yes (centroid) |
+| Phase 2 — clustering targeting | Two exits via soft-min | Yes, synchronous | Yes (k-means) |
 
 All gradients are derived analytically from first principles.
 
@@ -221,7 +222,7 @@ Identical derivation to the particle repulsion term. The robot position is
 fixed for the full step (read before any particle moves), consistent with
 synchronous updates.
 
-### Robot motion
+### Robot motion (Phase 1)
 
 ```
 target    = mean position of active particles within detection_radius of any exit
@@ -258,6 +259,75 @@ prediction, and IK can all be layered on top without changing this core loop.
 | `detection_radius` | 2.0   | Radius around each exit for flow detection |
 | `R_robot`          | 0.9   | Robot obstacle influence radius |
 | `w_robot`          | 50.0  | Robot obstacle penalty weight |
+
+---
+
+## Phase 2 — Clustering-Based Targeting
+
+### Concept
+
+Phase 2 replaces the global centroid heuristic with **k-means clustering** of
+near-exit particles. The robot targets the centroid of the *dominant* (largest)
+cluster instead of the mean of all detected particles.
+
+**Why clustering?**
+
+With two exits the global mean drifts to the midpoint between the two exit
+flows and never truly intercepts either one. K-means separates the flows into
+per-exit groups; targeting the largest cluster sends the robot into the densest
+stream of approaching particles — the one most worth disrupting.
+
+### k-means algorithm
+
+```
+Initialise k centroids by sampling k points at random (fixed seed)
+
+repeat n_iter times:
+    labels[i] = argmin_c  ||x_i - centroid_c||      (assignment)
+    centroid_c = mean of all x_i with labels[i] == c  (update)
+    # empty cluster → centroid unchanged (avoids NaN)
+
+return centroids, labels
+```
+
+Lloyd's algorithm with `n_iter=10` and `k=2` (one cluster per exit).
+Fixed random seed (`seed=0`) makes results deterministic across runs.
+
+### Dominant-cluster targeting
+
+```
+centroids, labels = kmeans(near_exit_positions, k=2)
+sizes     = bincount(labels)
+dominant  = argmax(sizes)          # cluster with the most particles
+target    = centroids[dominant]
+```
+
+### Edge cases
+
+| Situation | Behaviour |
+|-----------|-----------|
+| No particles near exits | Hold previous target |
+| Fewer than k particles near exits | Fall back to plain mean |
+| Cluster becomes empty mid-run | Centroid held at previous value |
+
+### Robot motion (Phase 2)
+
+```
+target    = centroid of dominant k-means cluster among near-exit particles
+           (fallback to mean / previous target — see edge cases above)
+
+robot_pos = robot_pos + robot_alpha * (target - robot_pos)
+```
+
+The obstacle cost, gradient, and per-step order are **identical to Phase 1** —
+only the targeting logic changes.
+
+### Visualisation additions
+
+| Element | What it shows |
+|---------|--------------|
+| Faint magenta circles | Robot influence radius `R_robot` swept along trajectory |
+| Small black dots | All k-means cluster centroids at sampled timesteps |
 
 ## Cost Field Visualisation
 
@@ -296,12 +366,13 @@ main.py
   robot_obstacle_cost(x, robot_pos, R_robot, w_robot)         — robot point obstacle cost
   grad_robot_obstacle(x, robot_pos, R_robot, w_robot)         — analytic robot gradient
   find_particles_near_exits(positions, active, exits, radius) — detect near-exit flow
-  update_robot_target(positions, active, exits, radius, prev) — centroid of detected flow
-  run_evacuation_with_robot_phase1(...)                       — Phase 1 simulation loop
+  kmeans(points, k, n_iter)                                   — Lloyd's k-means clustering
+  update_robot_target(positions, active, exits, radius, prev) — dominant-cluster targeting
+  run_evacuation_with_robot_phase1(...)                       — Phase 1/2 simulation loop
   plot_results(trajectory, ...)                               — single-particle plot
   plot_multi_particle_results(trajectories, ..., exits)       — all trajectories + exits
   plot_cost_field_and_vectors(x0, g, ...)                     — cost landscape + vectors
-  plot_evacuation_with_robot(trajs, robot_traj, ...)          — Phase 1 visualisation
+  plot_evacuation_with_robot(trajs, robot_traj, ...)          — Phase 2 visualisation
 ```
 
 ## Requirements
@@ -332,7 +403,8 @@ Six windows open in sequence:
 5. **Evacuation (soft-min)** — 25 particles in an open room with two exits.
    Each particle smoothly steers toward the cheaper exit; repulsion spreads
    load across both exits without any explicit assignment logic.
-6. **Phase 1 — robot interference** — same open room and exits. A robot point
-   starts at `(5,5)`, detects particles accumulating near exits, and moves to
-   intercept. Particles treat the robot as a dynamic obstacle. Robot trajectory
-   shown as dashed magenta; target trail shown as grey dots.
+6. **Phase 2 — robot with clustering** — same open room and exits. A robot
+   point starts at `(5,5)`, clusters near-exit particles with k-means (k=2),
+   and moves to intercept the dominant (largest) cluster. Robot trajectory
+   shown as dashed magenta; influence-radius circles shown as faint magenta
+   rings; cluster centroid trail shown as small black dots.

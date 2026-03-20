@@ -786,13 +786,58 @@ def find_particles_near_exits(positions, active, exits, detection_radius):
     return indices
 
 
-def update_robot_target(positions, active, exits, detection_radius, prev_target):
+def kmeans(points, k, n_iter=10):
     """
-    Compute the robot's new target position.
+    Minimal k-means for (M, 2) point arrays.
 
-    Strategy: move toward the mean position of particles currently near
-    exits.  If no particles are detected, hold the previous target so the
-    robot doesn't drift away.
+    Parameters
+    ----------
+    points : (M, 2) positions to cluster
+    k      : number of clusters
+    n_iter : Lloyd iterations
+
+    Returns
+    -------
+    centroids : (k, 2) cluster centres
+    labels    : (M,) int cluster index per point
+    """
+    rng = np.random.default_rng(seed=0)          # fixed seed → deterministic
+    idx = rng.choice(len(points), size=k, replace=False)
+    centroids = points[idx].copy()
+
+    labels = np.zeros(len(points), dtype=int)
+    for _ in range(n_iter):
+        # Assignment: each point → nearest centroid
+        dists = np.linalg.norm(points[:, None, :] - centroids[None, :, :], axis=2)
+        labels = np.argmin(dists, axis=1)
+        # Update: recompute centroid for each cluster
+        for c in range(k):
+            members = points[labels == c]
+            if len(members) > 0:
+                centroids[c] = members.mean(axis=0)
+            # else: keep old centroid — avoids NaN for empty cluster
+
+    return centroids, labels
+
+
+def update_robot_target(positions, active, exits, detection_radius, prev_target, k=2):
+    """
+    Compute the robot's new target using clustering (Phase 2).
+
+    Why clustering instead of a global centroid?
+      With two exits the global mean drifts to the midpoint *between* the two
+      exit flows and never truly intercepts either one.  K-means separates
+      the flows into per-exit groups; targeting the *dominant* (largest)
+      cluster sends the robot into the densest stream of approaching particles.
+
+    Strategy
+    --------
+    1. Find particles near any exit.
+    2. If none detected: hold previous target (no-op).
+    3. If fewer than k particles: fall back to their mean (not enough for
+       clustering — degenerate case).
+    4. Otherwise: run k-means(k), pick the cluster with the most members
+       (dominant cluster), and target its centroid.
 
     Parameters
     ----------
@@ -800,16 +845,26 @@ def update_robot_target(positions, active, exits, detection_radius, prev_target)
     active           : (N,) bool array
     exits            : (K, 2) exit positions
     detection_radius : float
-    prev_target      : (2,) last known target (used as fallback)
+    prev_target      : (2,) last known target (fallback)
+    k                : number of clusters (default 2 — one per exit)
 
     Returns
     -------
-    target : (2,) new robot target position
+    target    : (2,) new robot target
+    centroids : (k, 2) all cluster centroids, or None if clustering skipped
     """
     near = find_particles_near_exits(positions, active, exits, detection_radius)
     if len(near) == 0:
-        return prev_target                          # no flow detected — hold
-    return np.mean(positions[near], axis=0)         # centroid of near-exit flow
+        return prev_target, None               # no flow detected — hold
+
+    pts = positions[near]
+    if len(pts) < k:
+        return pts.mean(axis=0), None          # too few for clustering — use mean
+
+    centroids, labels = kmeans(pts, k=k)
+    sizes     = np.bincount(labels, minlength=k)
+    dominant  = np.argmax(sizes)               # cluster with the most particles
+    return centroids[dominant], centroids
 
 
 # ─────────────────────────────────────────────
@@ -861,17 +916,19 @@ def run_evacuation_with_robot_phase1(starts, exits, walls, beta=4.0,
     robot_pos    = np.array(robot_start if robot_start is not None
                             else [5.0, 5.0], dtype=float)
     robot_target = robot_pos.copy()
-    robot_traj   = [robot_pos.copy()]
-    robot_targets_log = [robot_target.copy()]
+    robot_traj         = [robot_pos.copy()]
+    robot_targets_log  = [robot_target.copy()]
+    cluster_centroids_log = [None]   # one entry per step; None until clustering fires
 
     for _ in range(n_steps):
         if not np.any(active):
             break
 
-        # ── a. Detect flow near exits ──────────────────────────────────────
-        robot_target = update_robot_target(
+        # ── a. Detect flow near exits; cluster into k groups ───────────────
+        robot_target, centroids = update_robot_target(
             positions, active, exits, detection_radius, robot_target
         )
+        cluster_centroids_log.append(centroids)   # (k,2) or None
 
         # ── b. Move robot toward target (proportional control) ────────────
         robot_pos = robot_pos + robot_alpha * (robot_target - robot_pos)
@@ -906,7 +963,8 @@ def run_evacuation_with_robot_phase1(starts, exits, walls, beta=4.0,
 
     return ([np.array(t) for t in trajs],
             np.array(robot_traj),
-            np.array(robot_targets_log))
+            np.array(robot_targets_log),
+            cluster_centroids_log)          # list of (k,2) arrays or None
 
 
 # ─────────────────────────────────────────────
@@ -914,15 +972,18 @@ def run_evacuation_with_robot_phase1(starts, exits, walls, beta=4.0,
 # ─────────────────────────────────────────────
 
 def plot_evacuation_with_robot(trajectories, robot_traj, robot_targets,
-                               starts, exits, walls):
+                               starts, exits, walls, R_robot=0.9,
+                               cluster_centroids_log=None):
     """
-    Plot the Phase 1 evacuation scene:
+    Plot the Phase 2 evacuation scene:
       - particle trajectories (hsv colour per particle)
       - start markers (same colour, black edge)
       - exit markers (lime stars, labelled)
       - robot trajectory (dashed magenta)
+      - robot influence-radius circles (faint magenta) at each step
       - robot final position (magenta X)
-      - robot target trail (small grey dots, optional)
+      - robot target trail (small grey dots)
+      - cluster centroids trail (black circles, optional)
       - walls (black)
     """
     N       = len(trajectories)
@@ -938,6 +999,17 @@ def plot_evacuation_with_robot(trajectories, robot_traj, robot_targets,
         ax.scatter(*traj[0], color=c, edgecolors='black',
                    s=45, zorder=5, linewidths=0.6)
 
+    # Robot influence-radius circles at each step (faint)
+    step = max(1, len(robot_traj) // 40)   # draw at most ~40 circles
+    for pos in robot_traj[::step]:
+        circle = plt.Circle(pos, R_robot, color='magenta',
+                            fill=False, linewidth=0.6, alpha=0.18, zorder=3)
+        ax.add_patch(circle)
+    # Final position gets a slightly more visible circle
+    circle_final = plt.Circle(robot_traj[-1], R_robot, color='magenta',
+                               fill=False, linewidth=1.2, alpha=0.55, zorder=6)
+    ax.add_patch(circle_final)
+
     # Robot trajectory
     ax.plot(robot_traj[:, 0], robot_traj[:, 1],
             color='magenta', linewidth=1.6, linestyle='--',
@@ -950,6 +1022,17 @@ def plot_evacuation_with_robot(trajectories, robot_traj, robot_targets,
     ax.scatter(robot_targets[:, 0], robot_targets[:, 1],
                color='grey', s=6, alpha=0.4, zorder=3,
                label='Robot target trail')
+
+    # Cluster centroids trail — every centroid from every timestep where
+    # clustering fired, sampled for readability.
+    if cluster_centroids_log is not None:
+        all_centroids = [c for c in cluster_centroids_log if c is not None]
+        if all_centroids:
+            step = max(1, len(all_centroids) // 60)
+            for c_arr in all_centroids[::step]:
+                ax.scatter(c_arr[:, 0], c_arr[:, 1],
+                           color='black', s=18, alpha=0.35,
+                           marker='o', zorder=4, linewidths=0)
 
     # Exits
     for k, ex in enumerate(exits):
@@ -976,16 +1059,20 @@ def plot_evacuation_with_robot(trajectories, robot_traj, robot_targets,
                linestyle='--', label='Robot trajectory'),
         Line2D([0], [0], marker='X', color='w', markerfacecolor='magenta',
                markeredgecolor='black', markersize=11, label='Robot (final)'),
+        Line2D([0], [0], color='magenta', linewidth=1.2, alpha=0.55,
+               label=f'Robot influence radius (R={R_robot})'),
         Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
                markersize=5, alpha=0.5, label='Robot target trail'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='black',
+               markersize=5, alpha=0.5, label='Cluster centroids'),
         Line2D([0], [0], color='black', linewidth=3, label='Wall'),
     ]
     ax.legend(handles=legend_handles, loc='upper right', fontsize=8)
     ax.set_xlim(0, 10)
     ax.set_ylim(0, 10)
     ax.set_aspect('equal')
-    ax.set_title(f"Phase 1 — Robot interference agent  (N={N})\n"
-                 "Robot tracks near-exit flow and acts as a dynamic obstacle")
+    ax.set_title(f"Phase 2 — Robot interference agent with clustering  (N={N})\n"
+                 "Robot targets dominant exit-flow cluster (k-means, k=2)")
     ax.grid(True, linestyle='--', alpha=0.4)
     plt.tight_layout()
     plt.show()
@@ -1125,16 +1212,18 @@ if __name__ == "__main__":
         np.random.uniform(3.0, 9.0, N),
     ])
 
-    phase1_trajs, robot_traj, robot_targets = run_evacuation_with_robot_phase1(
-        phase1_starts, exits, evac_walls,
-        beta=4.0, alpha=0.04, n_steps=1000, tol=0.15,
-        R_p=0.6,   w_p=30.0,
-        robot_start=[5.0, 5.0],
-        robot_alpha=0.08,
-        detection_radius=2.0,
-        R_robot=0.9, w_robot=50.0,
-    )
+    phase1_trajs, robot_traj, robot_targets, cluster_log = \
+        run_evacuation_with_robot_phase1(
+            phase1_starts, exits, evac_walls,
+            beta=4.0, alpha=0.04, n_steps=1000, tol=0.15,
+            R_p=0.6,   w_p=30.0,
+            robot_start=[5.0, 5.0],
+            robot_alpha=0.08,
+            detection_radius=2.0,
+            R_robot=0.9, w_robot=50.0,
+        )
     plot_evacuation_with_robot(
         phase1_trajs, robot_traj, robot_targets,
-        phase1_starts, exits, evac_walls
+        phase1_starts, exits, evac_walls,
+        R_robot=0.9, cluster_centroids_log=cluster_log
     )
