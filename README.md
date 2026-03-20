@@ -16,6 +16,7 @@ Four simulation modes are supported:
 | Evacuation (soft-min) | Two exits via soft-min | Yes, synchronous | No |
 | Phase 1 — robot interference | Two exits via soft-min | Yes, synchronous | Yes (centroid) |
 | Phase 2 — clustering targeting | Two exits via soft-min | Yes, synchronous | Yes (k-means) |
+| Phase 3 — prediction | Two exits via soft-min | Yes, synchronous | Yes (k-means + prediction) |
 
 All gradients are derived analytically from first principles.
 
@@ -322,12 +323,99 @@ robot_pos = robot_pos + robot_alpha * (target - robot_pos)
 The obstacle cost, gradient, and per-step order are **identical to Phase 1** —
 only the targeting logic changes.
 
-### Visualisation additions
+### Visualisation additions (Phase 2)
 
 | Element | What it shows |
 |---------|--------------|
 | Faint magenta circles | Robot influence radius `R_robot` swept along trajectory |
 | Small black dots | All k-means cluster centroids at sampled timesteps |
+
+---
+
+## Phase 3 — Prediction of Cluster Motion
+
+### Concept
+
+Phase 3 extends Phase 2 by estimating where the dominant cluster will be
+**H steps in the future** and sending the robot there instead of the current
+centroid.
+
+**Why prediction helps:**
+
+A purely reactive robot always targets where the cluster *was*. Because
+particles move continuously toward exits, a reactive robot lags behind and
+may arrive after the cluster has already passed through the exit. Predicting H
+steps ahead gives the robot a **lead** — it intercepts the flow before it
+reaches the exit rather than chasing it from behind.
+
+**How `horizon` affects behaviour:**
+
+| horizon | Effect |
+|---------|--------|
+| 0 | Equivalent to Phase 2 reactive targeting |
+| 3–8 | Sweet spot — meaningful lead without overshooting |
+| >10 | Predicted target may jump past the exit or leave the room |
+
+### Prediction formula
+
+```
+v         = current_dominant_centroid - previous_dominant_centroid   (velocity estimate)
+
+predicted = current_dominant_centroid + horizon * v
+```
+
+One-step finite difference gives a linear extrapolation. No smoothing or
+filtering is applied — the motion of the dominant centroid is already smooth
+because it is the mean of many particles.
+
+### predict_cluster_target helper
+
+```python
+predicted = predict_cluster_target(current_centroid, prev_centroid, horizon)
+```
+
+Falls back to `current_centroid` when `prev_centroid is None` (first step) or
+`horizon == 0`.
+
+### update_robot_target (Phase 3)
+
+Now returns 4 values:
+
+```
+target            — predicted dominant centroid (robot moves here)
+centroids         — (k, 2) all k-means centroids, or None
+dominant_centroid — (2,) current dominant centroid before prediction, or None
+predicted_target  — (2,) same as target when clustering fires, else None
+```
+
+### Per-step order (Phase 3)
+
+```
+1. cluster near-exit particles  →  dominant centroid (current)
+2. predict dominant centroid    →  predicted target  (current + H * v)
+3. move robot toward predicted target (proportional)
+4. snapshot particle positions
+5. compute all gradients:
+       soft-min goal + walls + inter-particle repulsion + robot repulsion
+6. apply all particle updates simultaneously
+7. save current dominant centroid as prev_dominant for next step
+```
+
+### Phase 3 parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `horizon` | 5 | Prediction look-ahead in steps (0 = reactive) |
+
+All other robot parameters are unchanged from Phase 1/2.
+
+### Visualisation additions (Phase 3)
+
+| Element | What it shows |
+|---------|--------------|
+| Blue squares | Dominant cluster centroid at sampled timesteps |
+| Orange diamonds | Predicted target at sampled timesteps |
+| Faint orange arrows | Direction and magnitude of prediction offset |
 
 ## Cost Field Visualisation
 
@@ -367,12 +455,13 @@ main.py
   grad_robot_obstacle(x, robot_pos, R_robot, w_robot)         — analytic robot gradient
   find_particles_near_exits(positions, active, exits, radius) — detect near-exit flow
   kmeans(points, k, n_iter)                                   — Lloyd's k-means clustering
-  update_robot_target(positions, active, exits, radius, prev) — dominant-cluster targeting
-  run_evacuation_with_robot_phase1(...)                       — Phase 1/2 simulation loop
+  predict_cluster_target(current, prev, horizon)              — linear extrapolation of cluster motion
+  update_robot_target(positions, active, exits, radius, prev) — clustering + prediction targeting
+  run_evacuation_with_robot_phase1(...)                       — Phase 1/2/3 simulation loop
   plot_results(trajectory, ...)                               — single-particle plot
   plot_multi_particle_results(trajectories, ..., exits)       — all trajectories + exits
   plot_cost_field_and_vectors(x0, g, ...)                     — cost landscape + vectors
-  plot_evacuation_with_robot(trajs, robot_traj, ...)          — Phase 2 visualisation
+  plot_evacuation_with_robot(trajs, robot_traj, ...)          — Phase 3 visualisation
 ```
 
 ## Requirements
@@ -403,8 +492,10 @@ Six windows open in sequence:
 5. **Evacuation (soft-min)** — 25 particles in an open room with two exits.
    Each particle smoothly steers toward the cheaper exit; repulsion spreads
    load across both exits without any explicit assignment logic.
-6. **Phase 2 — robot with clustering** — same open room and exits. A robot
-   point starts at `(5,5)`, clusters near-exit particles with k-means (k=2),
-   and moves to intercept the dominant (largest) cluster. Robot trajectory
-   shown as dashed magenta; influence-radius circles shown as faint magenta
-   rings; cluster centroid trail shown as small black dots.
+6. **Phase 3 — robot with clustering + prediction** — same open room and
+   exits. A robot point starts at `(5,5)`, clusters near-exit particles with
+   k-means (k=2), predicts the dominant cluster's position 5 steps ahead, and
+   moves to intercept that predicted position. Robot trajectory shown as dashed
+   magenta; influence-radius circles as faint magenta rings; dominant centroid
+   trail as blue squares; predicted target trail as orange diamonds with
+   directional arrows.
